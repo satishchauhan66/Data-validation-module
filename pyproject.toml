@@ -1,0 +1,60 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "datavalidation"
+version = "2.0.0"
+description = "Lightweight Python library for DB2-to-Azure and Azure-to-Azure migration validation"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+authors = [{ name = "Satish Chauhan", email = "satishchauhan603@gmail.com" }]
+keywords = ["validation", "db2", "azure-sql", "migration", "schema", "data"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Database",
+]
+
+dependencies = [
+    "sqlalchemy>=2.0",
+    "pyodbc>=4.0",
+    "pandas>=1.5",
+    # DB2: native + JDBC fallback (single pip install works for DB2 and Azure)
+    "ibm_db>=3.1",
+    "ibm_db_sa>=0.4",
+    "packaging",
+    "jaydebeapi>=1.2",
+    "jpype1>=1.4",
+    # Azure SQL with Azure AD / MFA
+    "azure-identity>=1.12",
+]
+
+[project.optional-dependencies]
+yaml = [
+    "pyyaml>=6.0",
+]
+examples = [
+    "python-dotenv>=1.0.0",
+]
+all = [
+    "datavalidation[yaml]",
+    "datavalidation[examples]",
+]
+
+[project.urls]
+Documentation = "https://github.com/satishchauhan66/Data-validation-module#readme"
+Repository = "https://github.com/satishchauhan66/Data-validation-module"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["datavalidation*"]
+
+[tool.setuptools.package-data]
+datavalidation = ["drivers/README.md"]

@@ -1,0 +1,8 @@
+# DB2 + Azure deps (included in default pip install datavalidation).
+# Shown here for reference or minimal/standalone install.
+# One-step install: pip install datavalidation
+ibm_db>=3.1
+ibm_db_sa>=0.4
+packaging
+jaydebeapi>=1.2
+jpype1>=1.4
