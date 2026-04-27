@@ -27,6 +27,52 @@ DEFAULT_SCHEMA_OBJECT_TYPES: list[str] = [
     "SEQUENCE",
 ]
 
+# Data validations run by :meth:`datavalidation.validators.data.DataValidator.run_all` (canonical order).
+DATA_VALIDATION_PHASE_KEYS: tuple[str, ...] = (
+    "row_counts",
+    "column_nulls",
+    "distinct_keys",
+    "checksum",
+    "referential_integrity",
+    "constraint_integrity",
+)
+
+
+def resolve_data_validation_phases(
+    env_value: str | None,
+    options_phases: list[str] | None,
+) -> tuple[str, ...]:
+    """Resolve which data validations run.
+
+    ``DV_DATA_VALIDATIONS`` (same format as ``env_value`` here) overrides ``options_phases``.
+    Comma-separated names; ``all`` expands to every phase. Hyphens accepted (e.g. ``row-counts``).
+    Unknown tokens are ignored.
+
+    Defaults to ``row_counts`` only when nothing valid remains (fast CLI default).
+    """
+    allowed = frozenset(DATA_VALIDATION_PHASE_KEYS)
+
+    def _ordered(selection: frozenset[str]) -> tuple[str, ...]:
+        return tuple(k for k in DATA_VALIDATION_PHASE_KEYS if k in selection)
+
+    raw = (env_value or "").strip()
+    if raw:
+        parts = [p.strip().lower().replace("-", "_") for p in raw.split(",") if p.strip()]
+        if "all" in parts:
+            return tuple(DATA_VALIDATION_PHASE_KEYS)
+        sel = allowed.intersection(parts)
+        out = _ordered(sel)
+        return out if out else ("row_counts",)
+
+    opts = options_phases if options_phases else []
+    sel_set: set[str] = set()
+    for p in opts:
+        pn = str(p).strip().lower().replace("-", "_")
+        if pn in allowed:
+            sel_set.add(pn)
+    out = _ordered(frozenset(sel_set))
+    return out if out else ("row_counts",)
+
 
 @dataclass
 class ConnectionConfig:
@@ -86,9 +132,19 @@ class ValidationOptions:
         row_count_timeout_seconds: best-effort per-table query timeout (JDBC ``setQueryTimeout`` and
             pyodbc ``connection.timeout``). When exact times out in ``auto`` mode, the validator falls
             back to the catalog estimate so the run completes.
+        data_query_timeout_seconds: optional cap (seconds) for **non-row-count** data SQL (distinct keys,
+            checksum, FK probes, null checks, etc.). Prevents those statements from hanging indefinitely
+            under locks or on huge tables. Env ``DV_DATA_QUERY_TIMEOUT_SEC`` overrides (``0`` = no limit).
         exclude_tables: case-insensitive table names to skip (e.g. archive/staging tables).
         estimate_tables: case-insensitive table names that always use the estimate path.
         estimate_tolerance_pct: when comparing two estimates, treat |s-t|/max(s,t) <= pct/100 as match.
+        checksum_mode: ``aggregate`` (default) uses ``CHECKSUM_AGG`` per table; ``row_hash`` runs per-row
+            key + fingerprint SQL (Azure ``HASHBYTES`` / DB2 ``HASH``) for closer legacy parity. Also set
+            ``DV_CHECKSUM_MODE`` to override.
+        checksum_row_cap: max rows pulled per side in ``row_hash`` mode (guards memory).
+        checksum_max_mismatches: max mismatch detail rows emitted per table in ``row_hash`` mode.
+        data_validation_phases: subset of :data:`DATA_VALIDATION_PHASE_KEYS` to run (default ``['row_counts']``
+            only for faster runs). Env ``DV_DATA_VALIDATIONS`` overrides (use ``all`` for full suite).
     """
     parallel_workers: int = 4
     datatype_leniency: bool = False
@@ -99,9 +155,14 @@ class ValidationOptions:
     large_table_threshold_bytes: int = 50 * 1024 ** 3
     count_with_dirty_read: bool = True
     row_count_timeout_seconds: int | None = None
+    data_query_timeout_seconds: int | None = None
     exclude_tables: list[str] = field(default_factory=list)
     estimate_tables: list[str] = field(default_factory=list)
     estimate_tolerance_pct: float = 1.0
+    checksum_mode: str = "aggregate"  # 'aggregate' | 'row_hash'
+    checksum_row_cap: int = 100_000
+    checksum_max_mismatches: int = 10_000
+    data_validation_phases: list[str] = field(default_factory=lambda: ["row_counts"])
 
 
 def _env(key: str, default: str = "") -> str:
@@ -161,8 +222,27 @@ def load_config_from_file(path: str | Path) -> tuple[ConnectionConfig, Connectio
         large_table_threshold_bytes=int(opts_data.get("large_table_threshold_bytes", 50 * 1024 ** 3)),
         count_with_dirty_read=bool(opts_data.get("count_with_dirty_read", True)),
         row_count_timeout_seconds=(int(opts_data["row_count_timeout_seconds"]) if opts_data.get("row_count_timeout_seconds") else None),
+        data_query_timeout_seconds=(int(opts_data["data_query_timeout_seconds"]) if opts_data.get("data_query_timeout_seconds") else None),
         exclude_tables=list(opts_data.get("exclude_tables", []) or []),
         estimate_tables=list(opts_data.get("estimate_tables", []) or []),
         estimate_tolerance_pct=float(opts_data.get("estimate_tolerance_pct", 1.0)),
+        checksum_mode=str(opts_data.get("checksum_mode", "aggregate")).strip().lower() or "aggregate",
+        checksum_row_cap=int(opts_data.get("checksum_row_cap", 100_000)),
+        checksum_max_mismatches=int(opts_data.get("checksum_max_mismatches", 10_000)),
+        data_validation_phases=_parse_data_validation_phases_opt(opts_data.get("data_validation_phases")),
     )
     return source, target, options
+
+
+def _parse_data_validation_phases_opt(raw: Any) -> list[str]:
+    """YAML/JSON ``data_validation_phases``: list or comma-separated string."""
+    if raw is None:
+        return ["row_counts"]
+    if isinstance(raw, str):
+        parts = [x.strip() for x in raw.split(",") if x.strip()]
+        return list(parts) if parts else ["row_counts"]
+    try:
+        parts = [str(x).strip() for x in raw if str(x).strip()]
+        return parts if parts else ["row_counts"]
+    except TypeError:
+        return ["row_counts"]

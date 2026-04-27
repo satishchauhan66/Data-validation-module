@@ -43,6 +43,13 @@ class DB2Adapter(ConnectionAdapter):
         except OSError as e:
             if "DLL" not in str(e) and "module" not in str(e).lower():
                 raise
+        except Exception as e:
+            # SQLAlchemy raises NoSuchModuleError when db2+ibm_db dialect isn't installed — fall back to JDBC.
+            msg = str(e).lower()
+            if "can't load plugin" in msg and "ibm_db" in msg:
+                pass
+            else:
+                raise
         # 2) Fallback: JDBC (packed driver in drivers/ or auto-download)
         try:
             from datavalidation.connectors.db2_jdbc import connect_db2_jdbc, ensure_db2_jdbc_driver
@@ -58,15 +65,27 @@ class DB2Adapter(ConnectionAdapter):
                 "or set DB2_JDBC_DRIVER_PATH. The library can also auto-download it if Java is installed."
             )
         port = self.config.port or 50000
-        self._connection = connect_db2_jdbc(
-            host=self.config.host,
-            port=port,
-            database=self.config.database,
-            user=self.config.username or "",
-            password=self.config.password or "",
-            jar_path=jar_path,
-            connect_timeout_seconds=self.config.connect_timeout_seconds,
-        )
+        try:
+            self._connection = connect_db2_jdbc(
+                host=self.config.host,
+                port=port,
+                database=self.config.database,
+                user=self.config.username or "",
+                password=self.config.password or "",
+                jar_path=jar_path,
+                connect_timeout_seconds=self.config.connect_timeout_seconds,
+            )
+        except Exception as e:
+            msg = str(e).lower()
+            if "refused" in msg or "4499" in str(e) or "08001" in str(e) or "connect" in msg and "timed out" in msg:
+                raise RuntimeError(
+                    "DB2 connection failed (network): TCP refused, unreachable, or login timeout. "
+                    f"Tried host={self.config.host!r} port={port} database={self.config.database!r}. "
+                    "If the hostname resolves to a private address (10.x, 172.x, 192.168.x), connect "
+                    "from the corporate network or VPN. Confirm DB2 is running, "
+                    "DV_SOURCE_HOST and DV_SOURCE_PORT in .env match the server, and firewalls allow this client."
+                ) from e
+            raise
         self._use_jdbc = True
 
     def execute(

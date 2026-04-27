@@ -5,6 +5,9 @@ Minimal example: load credentials from environment (see repo root ``.env.example
   copy ..\\.env.example ..\\.env   # then edit .env
 
 Or set ``DV_SOURCE_*`` / ``DV_TARGET_*`` in the shell before running.
+
+By default ``validate_data`` runs **row counts only**. Set ``DV_DATA_VALIDATIONS=all``
+(or pass ``ValidationOptions(data_validation_phases=[...])``) for checksum, FK checks, etc.
 """
 from __future__ import annotations
 

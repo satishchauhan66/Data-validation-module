@@ -7,6 +7,9 @@ Quick start: schema, data, and behavior validations; writes legacy CSVs under
 Recommended: copy ``.env.example`` to ``.env`` at the repo root and run
 ``pip install python-dotenv`` so this script loads ``.env`` automatically.
 
+Data validation defaults to **row counts only** (fast). Enable more checks with
+``DV_DATA_VALIDATIONS`` (e.g. ``all`` or ``row_counts,distinct_keys,checksum``).
+
 Override output layout with ``DV_OUTPUT_ORG`` / ``DV_OUTPUT_INSTANCE``.
 """
 from __future__ import annotations
@@ -69,6 +72,17 @@ def _build_options() -> ValidationOptions:
     except ValueError:
         q_timeout = 0
 
+    # Cap DISTINCT/CHECKSUM/FK/null SQL so a single huge table cannot block completion (0 = no cap).
+    try:
+        dq_raw = os.environ.get("DV_DATA_QUERY_TIMEOUT_SEC", "").strip()
+        if dq_raw == "":
+            dq_timeout = 600
+        else:
+            dq_iv = int(dq_raw)
+            dq_timeout = None if dq_iv <= 0 else dq_iv
+    except ValueError:
+        dq_timeout = 600
+
     def _csv(name: str) -> list[str]:
         raw = os.environ.get(name, "") or ""
         return [s.strip() for s in raw.split(",") if s.strip()]
@@ -78,6 +92,7 @@ def _build_options() -> ValidationOptions:
         large_table_threshold_bytes=int(threshold_gb * 1024**3),
         count_with_dirty_read=dirty,
         row_count_timeout_seconds=(q_timeout or None),
+        data_query_timeout_seconds=dq_timeout,
         exclude_tables=_csv("DV_EXCLUDE_TABLES"),
         estimate_tables=_csv("DV_ESTIMATE_TABLES"),
         estimate_tolerance_pct=tol,

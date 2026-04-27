@@ -205,7 +205,7 @@ class ValidationClient:
         schemas: tuple[str, str],
         object_types: list[str] | None = None,
     ) -> ValidationReport:
-        """Run all data validations."""
+        """Run selected data validations (default: row counts only; see ``ValidationOptions.data_validation_phases``)."""
         results = self._data().run_all(schemas[0], schemas[1], object_types)
         return ValidationReport(results=results)
 

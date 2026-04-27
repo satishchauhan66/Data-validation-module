@@ -232,3 +232,40 @@ class DB2Dialect(SQLDialect):
         col_list = ", ".join(f'"{c}"' for c in columns[:20])  # limit columns
         s, t = schema.upper(), table_name.upper()
         return f'SELECT CHECKSUM_AGG(CHECKSUM({col_list})) AS cs FROM "{s}"."{t}"'
+
+    def checksum_row_fingerprint_query(
+        self,
+        schema: str,
+        table_name: str,
+        key_columns: list[str],
+        value_columns: list[str],
+    ) -> str | None:
+        """Per-row key string + ``HASH`` fingerprint (hex) for value columns (Db2 LUW-style)."""
+        if not key_columns:
+            return None
+
+        def qc(c: str) -> str:
+            return '"' + str(c).upper().replace('"', '""') + '"'
+
+        s = str(schema).upper().replace('"', '""')
+        tn = str(table_name).upper().replace('"', '""')
+        tbl = f'"{s}"."{tn}"'
+        kcols = key_columns[:16]
+        vcols = value_columns[:32]
+
+        key_parts = [f"RTRIM(CAST({qc(k)} AS VARCHAR(32000)))" for k in kcols]
+        if len(key_parts) == 1:
+            key_expr = key_parts[0]
+        else:
+            key_expr = " CONCAT '|' CONCAT ".join(key_parts)
+
+        if vcols:
+            val_inner = " CONCAT ".join(f"COALESCE(CAST({qc(v)} AS VARCHAR(32000)), '')" for v in vcols)
+        else:
+            val_inner = "''"
+
+        return f"""
+SELECT CAST({key_expr} AS VARCHAR(32000)) AS KeySig,
+       LOWER(HEX(HASH({val_inner}))) AS RowHash
+FROM {tbl}
+""".strip()

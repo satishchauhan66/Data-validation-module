@@ -87,3 +87,13 @@ class SQLDialect(ABC):
     def checksum_query(self, schema: str, table_name: str, columns: list[str]) -> str:
         """SQL for checksum/hash of table data. Override in subclass."""
         raise NotImplementedError
+
+    def checksum_row_fingerprint_query(
+        self,
+        schema: str,
+        table_name: str,
+        key_columns: list[str],
+        value_columns: list[str],
+    ) -> str | None:
+        """Optional per-row ``KeySig`` + ``RowHash`` for row-level checksum. Return ``None`` to skip."""
+        return None

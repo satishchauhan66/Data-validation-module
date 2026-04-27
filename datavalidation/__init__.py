@@ -16,7 +16,12 @@ Usage:
 """
 from datavalidation.client import ValidationClient
 from datavalidation.results import ValidationResult, ValidationReport
-from datavalidation.config import ConnectionConfig, ValidationOptions
+from datavalidation.config import (
+    ConnectionConfig,
+    ValidationOptions,
+    DATA_VALIDATION_PHASE_KEYS,
+    resolve_data_validation_phases,
+)
 
 __version__ = "2.0.0"
 __all__ = [
@@ -25,4 +30,6 @@ __all__ = [
     "ValidationReport",
     "ConnectionConfig",
     "ValidationOptions",
+    "DATA_VALIDATION_PHASE_KEYS",
+    "resolve_data_validation_phases",
 ]

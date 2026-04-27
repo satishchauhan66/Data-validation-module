@@ -252,3 +252,40 @@ class AzureSQLDialect(SQLDialect):
         s = schema.replace("]", "]]")
         t = table_name.replace("]", "]]")
         return f"SELECT CHECKSUM_AGG(CHECKSUM({col_list})) AS cs FROM [{s}].[{t}]"
+
+    def checksum_row_fingerprint_query(
+        self,
+        schema: str,
+        table_name: str,
+        key_columns: list[str],
+        value_columns: list[str],
+    ) -> str | None:
+        """Per-row ``KeySig`` + SHA-256 hex ``RowHash`` for non-key columns (legacy-style row checksum)."""
+        if not key_columns:
+            return None
+
+        def br(c: str) -> str:
+            return f"[{str(c).replace(']', ']]')}]"
+
+        s = schema.replace("]", "]]")
+        t = table_name.replace("]", "]]")
+        kcols = key_columns[:16]
+        vcols = value_columns[:32]
+
+        if len(kcols) == 1:
+            key_expr = f"CAST({br(kcols[0])} AS NVARCHAR(MAX))"
+        else:
+            key_expr = "CONCAT_WS(N'|', " + ", ".join(f"CAST({br(c)} AS NVARCHAR(MAX))" for c in kcols) + ")"
+
+        if vcols:
+            val_expr = "CONCAT_WS(N'||', " + ", ".join(
+                f"ISNULL(CAST({br(c)} AS NVARCHAR(MAX)), N'<NULL>')" for c in vcols
+            ) + ")"
+        else:
+            val_expr = "N''"
+
+        return f"""
+SELECT CAST({key_expr} AS NVARCHAR(MAX)) AS KeySig,
+       LOWER(CONVERT(VARCHAR(64), HASHBYTES('SHA2_256', {val_expr}), 2)) AS RowHash
+FROM [{s}].[{t}]
+""".strip()
