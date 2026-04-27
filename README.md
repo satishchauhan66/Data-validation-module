@@ -16,6 +16,36 @@ Optional: YAML config file support:
 pip install datavalidation[yaml]
 ```
 
+### Install from GitHub (pinned version)
+
+Pinned to **`v2.0.0`** (same as `version` in `pyproject.toml`):
+
+```bash
+pip install "git+https://github.com/satishchauhan66/Data-validation-module.git@v2.0.0"
+```
+
+In `requirements.txt`:
+
+```text
+datavalidation @ git+https://github.com/satishchauhan66/Data-validation-module.git@v2.0.0
+```
+
+With extras (e.g. YAML):
+
+```text
+datavalidation[yaml] @ git+https://github.com/satishchauhan66/Data-validation-module.git@v2.0.0
+```
+
+#### Publish the tag on GitHub
+
+Push the annotated tag so installs using `@v2.0.0` resolve:
+
+```bash
+git push origin v2.0.0
+```
+
+Next release: bump `version` in `pyproject.toml`, commit, tag `v2.1.0`, push `main`, then `git push origin v2.1.0`.
+
 ## Quick start
 
 ```python

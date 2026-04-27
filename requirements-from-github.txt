@@ -1,0 +1,3 @@
+# Pinned to the v2.0.0 release tag. After `git push origin v2.0.0`, use:
+#   pip install -r requirements-from-github.txt
+datavalidation @ git+https://github.com/satishchauhan66/Data-validation-module.git@v2.0.0
