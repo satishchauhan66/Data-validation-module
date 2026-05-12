@@ -3,6 +3,8 @@ Schema validations: table presence, column counts, datatype mapping, nullable, d
 """
 from __future__ import annotations
 
+import re
+from collections import defaultdict
 from typing import Any
 
 from datavalidation.reporting.cross_schema import build_table_pairs_from_catalog_rows
@@ -51,16 +53,44 @@ def _fk_delete_update(row: dict[str, Any], dialect_name: str) -> tuple[str, str]
     return _azure_fk_delete_update(row)
 
 
+def _catalog_object_type_label(raw: Any) -> str:
+    """Normalize SYSIBM.SYSTABLES / sys.objects type codes (or names) to TABLE or VIEW for reporting."""
+    u = str(raw if raw is not None else "").strip().upper()
+    if u in ("T", "U", "TABLE"):
+        return "TABLE"
+    if u in ("V", "VIEW"):
+        return "VIEW"
+    return u or "TABLE"
+
+
+def _normalize_fk_pairs_key(pairs: str) -> str:
+    """Normalize FK fk->pk column pair list for cross-dialect signature matching."""
+    p = " ".join(str(pairs or "").strip().upper().split())
+    return re.sub(r"\s*->\s*", "->", p)
+
+
+def _fk_row_constraint_name_u(r: dict[str, Any]) -> str:
+    """FK / constraint name from a catalog row (DB2 may expose ``constname``; JDBC keys vary)."""
+    v = r.get("fk_name") or r.get("constname")
+    if v is None or (isinstance(v, str) and not str(v).strip()):
+        v = r.get("FK_NAME") or r.get("CONSTNAME")
+    return str(v or "").strip().upper()
+
+
 def _fk_column_pair_string(col_rows: list[dict[str, Any]], table_u: str, fk_u: str) -> str:
+    fk_u = fk_u.strip().upper()
     sub = [
         r
         for r in col_rows
-        if str(r.get("table_name", "")).strip().upper() == table_u and str(r.get("fk_name", "")).strip().upper() == fk_u
+        if str(r.get("table_name", "")).strip().upper() == table_u and _fk_row_constraint_name_u(r) == fk_u
     ]
 
     def seq_key(r: dict[str, Any]) -> int:
+        raw = r.get("col_seq")
+        if raw is None:
+            raw = r.get("COL_SEQ") or r.get("constraint_column_id")
         try:
-            return int(r.get("col_seq"))
+            return int(raw)
         except (TypeError, ValueError):
             return 0
 
@@ -70,11 +100,54 @@ def _fk_column_pair_string(col_rows: list[dict[str, Any]], table_u: str, fk_u: s
     )
 
 
+def _fk_ordered_fk_columns_key_only(col_rows: list[dict[str, Any]], table_u: str, fk_u: str) -> str:
+    """Child-side FK column names in key order (excludes referenced PK names) for cross-dialect orphan pairing."""
+    fk_u = fk_u.strip().upper()
+    sub = [
+        r
+        for r in col_rows
+        if str(r.get("table_name", "")).strip().upper() == table_u and _fk_row_constraint_name_u(r) == fk_u
+    ]
+
+    def seq_key(r: dict[str, Any]) -> int:
+        raw = r.get("col_seq")
+        if raw is None:
+            raw = r.get("COL_SEQ") or r.get("constraint_column_id")
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return 0
+
+    sub = sorted(sub, key=seq_key)
+    return ",".join(_norm_whitespace_upper(r.get("fk_column")) for r in sub if str(r.get("fk_column") or "").strip())
+
+
+def _fk_loose_bucket_key(
+    r: dict[str, Any],
+    fk_col_rows: list[dict[str, Any]],
+) -> tuple[str, str, frozenset[str]]:
+    """Match orphans when full fk->pk string differs but child table, ref table, and FK column set agree."""
+    tbl_u = str(r.get("table_name", "")).strip().upper()
+    ref_t = str(r.get("ref_table", "")).strip().upper()
+    fk_u = _fk_row_constraint_name_u(r)
+    names: list[str] = []
+    for row in fk_col_rows:
+        if str(row.get("table_name", "")).strip().upper() != tbl_u:
+            continue
+        if _fk_row_constraint_name_u(row) != fk_u:
+            continue
+        fc = str(row.get("fk_column", "") or "").strip().upper()
+        if fc:
+            names.append(fc)
+    return (tbl_u, ref_t, frozenset(names))
+
+
 def _fk_ref_tables_match(
     sr: dict[str, Any],
     tr: dict[str, Any],
     source_schema: str | None,
     target_schema: str | None,
+    resolved_source_schema: str | None = None,
 ) -> bool:
     st = str(sr.get("ref_table") or "").strip().upper()
     tt = str(tr.get("ref_table") or "").strip().upper()
@@ -85,12 +158,59 @@ def _fk_ref_tables_match(
     if rss == rts:
         return True
     ssu = (source_schema or "").strip().upper()
+    rsu = (resolved_source_schema or "").strip().upper()
     tsu = (target_schema or "").strip().upper()
-    return bool(ssu and tsu and rss == ssu and rts == tsu)
+    if not tsu:
+        return False
+    src_ok = rss == ssu or (bool(rsu) and rss == rsu)
+    tgt_ok = rts == tsu
+    return bool(src_ok and tgt_ok)
+
+
+def _fk_signature(tbl_u: str, fk_u: str, fk_col_rows: list[dict[str, Any]], row: dict[str, Any]) -> tuple[str, str, str]:
+    """Logical FK identity for pairing: child table, referenced table, ordered child FK columns (PK names excluded).
+
+    DB2 and Azure often use different referenced-column names in catalogs for the same FK; matching on ``fk->pk``
+    strings alone produces false orphan SOURCE_ONLY / TARGET_ONLY pairs.
+    """
+    ref_t = str(row.get("ref_table") or "").strip().upper()
+    fk_only = _fk_ordered_fk_columns_key_only(fk_col_rows, tbl_u, fk_u)
+    return (tbl_u, ref_t, _normalize_fk_pairs_key(fk_only))
+
+
+def _fk_mismatch_description(
+    *,
+    refs_ok: bool,
+    ref_table_match: bool,
+    pairs_match: bool,
+    actions_match: bool,
+) -> str:
+    if not ref_table_match or not refs_ok:
+        return "Referenced table mismatch"
+    if not pairs_match:
+        return "Foreign key column mapping mismatch"
+    if not actions_match:
+        return "Foreign key delete/update rule mismatch"
+    return "Foreign key definition mismatch"
 
 
 class SchemaValidator(BaseValidator):
     """Runs all schema-level validations."""
+
+    def _table_kind_map(self, resolved_schema: str | None, *, source: bool) -> dict[str, str]:
+        """Uppercase table/view name -> TABLE or VIEW (queries both kinds for accurate labels)."""
+        dialect = self._source_dialect if source else self._target_dialect
+        execute = self._source_execute if source else self._target_execute
+        out: dict[str, str] = {}
+        try:
+            rows = execute(dialect.catalog_tables_query(resolved_schema, ["TABLE", "VIEW"])) or []
+        except Exception:
+            return out
+        for r in rows:
+            t = str(r.get("table_name", "")).strip().upper()
+            if t:
+                out[t] = _catalog_object_type_label(r.get("object_type"))
+        return out
 
     def validate_table_presence(
         self,
@@ -111,11 +231,7 @@ class SchemaValidator(BaseValidator):
             """Normalize row to schema_name, object_name, object_type. object_name from object_name or table_name."""
             schema = str(r.get("schema_name") or "").strip()
             obj_name = str(r.get("object_name") or r.get("table_name") or "").strip()
-            typ = str(r.get("object_type") or "TABLE").strip().upper()
-            if typ in ("T", "U"):
-                typ = "TABLE"
-            elif typ == "V":
-                typ = "VIEW"
+            typ = _catalog_object_type_label(r.get("object_type"))
             return {"schema_name": schema, "object_name": obj_name, "object_type": typ}
 
         def run_src_base(schema_val: str) -> list[dict]:
@@ -126,7 +242,7 @@ class SchemaValidator(BaseValidator):
                     out.append(norm({**r, "object_name": str(r.get("table_name") or r.get("object_name") or "").strip()}))
             else:
                 for r in self._source_execute(src_d.catalog_tables_query(schema_val, base_types or ["TABLE"])):
-                    out.append(norm({**r, "object_type": "TABLE" if str(r.get("object_type") or "").strip().upper() in ("T", "U") else "VIEW"}))
+                    out.append(norm({**r, "object_type": _catalog_object_type_label(r.get("object_type"))}))
             return out
 
         src_rows: list[dict] = []
@@ -145,7 +261,7 @@ class SchemaValidator(BaseValidator):
                     tgt_rows.append(norm({**r, "object_name": str(r.get("table_name") or r.get("object_name") or "").strip()}))
             else:
                 for r in self._target_execute(tgt_d.catalog_tables_query(target_schema, base_types or ["TABLE"])):
-                    tgt_rows.append(norm({**r, "object_type": "TABLE" if str(r.get("object_type") or "").strip().upper() in ("T", "U") else "VIEW"}))
+                    tgt_rows.append(norm({**r, "object_type": _catalog_object_type_label(r.get("object_type"))}))
 
         # SEQUENCE, INDEX, CONSTRAINT from presence-specific queries
         seen_src_keys = {(str(r.get("object_name", "")).strip().upper(), str(r.get("object_type", "")).strip().upper()) for r in src_rows}
@@ -217,7 +333,7 @@ class SchemaValidator(BaseValidator):
         target_schema: str | None = None,
         object_types: list[str] | None = None,
     ) -> ValidationResult:
-        """Compare column count per table between source and target. Matches tables by table name across schemas (USERID->dbo)."""
+        """Compare column count per table/view between source and target. Matches names across schemas (USERID->dbo)."""
         object_types = object_types or self.options.object_types
         resolved_src = getattr(self, "_resolve_source_schema", lambda s: s)(source_schema) or source_schema
         src_d, tgt_d = self._source_dialect, self._target_dialect
@@ -227,6 +343,16 @@ class SchemaValidator(BaseValidator):
             if src_tables:
                 resolved_src = "USERID"
         tgt_tables = self._target_execute(tgt_d.catalog_tables_query(target_schema, object_types))
+        src_table_kind = {
+            str(r.get("table_name", "")).strip().upper(): _catalog_object_type_label(r.get("object_type"))
+            for r in src_tables
+            if str(r.get("table_name", "")).strip()
+        }
+        tgt_table_kind = {
+            str(r.get("table_name", "")).strip().upper(): _catalog_object_type_label(r.get("object_type"))
+            for r in tgt_tables
+            if str(r.get("table_name", "")).strip()
+        }
         src_table_names = {str(r.get("table_name", "")).strip() for r in src_tables}
         tgt_table_names = {str(r.get("table_name", "")).strip() for r in tgt_tables}
         # Case-insensitive common tables (USERID->dbo mapping)
@@ -239,6 +365,9 @@ class SchemaValidator(BaseValidator):
             tgt_cols = self._target_execute(tgt_d.catalog_columns_query(target_schema, tgt_tbl))
             sc, tc = len(src_cols), len(tgt_cols)
             if sc != tc:
+                sk = src_table_kind.get(src_tbl.strip().upper(), "TABLE")
+                tk = tgt_table_kind.get(tgt_tbl.strip().upper(), "TABLE")
+                ot = "VIEW" if (sk == "VIEW" or tk == "VIEW") else "TABLE"
                 details.append({
                     "source_schema": source_schema, "target_schema": target_schema,
                     "schema": source_schema, "table": src_tbl, "status": "MISMATCH",
@@ -248,13 +377,13 @@ class SchemaValidator(BaseValidator):
                     "element_path": element_path(source_schema or "", src_tbl),
                     "error_code": "COLUMN_COUNT_MISMATCH",
                     "error_description": "Column count mismatch between source and target",
-                    "object_type": "TABLE",
+                    "object_type": ot,
                 })
         passed = len(details) == 0
         return ValidationResult(
             validation_name="column_counts",
             passed=passed,
-            summary=f"Compared {len(common_pairs)} tables; {len(details)} column count mismatch(es).",
+            summary=f"Compared {len(common_pairs)} table(s)/view(s); {len(details)} column count mismatch(es).",
             details=details,
             stats={"tables_compared": len(common_pairs), "mismatch_count": len(details)},
         )
@@ -273,6 +402,7 @@ class SchemaValidator(BaseValidator):
             if src_cols:
                 resolved_src = "USERID"
         tgt_cols = self._target_execute(tgt_d.catalog_columns_query(target_schema, None))
+        src_kind = self._table_kind_map(resolved_src, source=True)
         # Match by (table_name, column_name) case-insensitive for cross-schema USERID->dbo
         tgt_by_key = {}
         for r in tgt_cols:
@@ -290,6 +420,7 @@ class SchemaValidator(BaseValidator):
             src_type = str(r.get("data_type", "")).strip().upper()
             tgt_type = str(tr.get("data_type", "")).strip()
             if not is_compatible_type(src_type, tgt_type):
+                ot = src_kind.get(tbl.upper(), "TABLE")
                 details.append({
                     "source_schema": source_schema, "target_schema": target_schema,
                     "schema": sch, "table": tbl, "column": col,
@@ -298,7 +429,7 @@ class SchemaValidator(BaseValidator):
                     "element_path": element_path(source_schema or sch, tbl, col),
                     "error_code": "DATATYPE_NAME_MISMATCH",
                     "error_description": "Data type name mismatch",
-                    "object_type": "TABLE",
+                    "object_type": ot,
                 })
         passed = len(details) == 0
         return ValidationResult(
@@ -323,6 +454,7 @@ class SchemaValidator(BaseValidator):
             if src_cols:
                 resolved_src = "USERID"
         tgt_cols = self._target_execute(tgt_d.catalog_columns_query(target_schema, None))
+        src_kind = self._table_kind_map(resolved_src, source=True)
         tgt_by_key = {}
         for r in tgt_cols:
             tbl = str(r.get("table_name", "")).strip()
@@ -339,6 +471,7 @@ class SchemaValidator(BaseValidator):
             src_null = r.get("is_nullable")
             tgt_null = tr.get("is_nullable")
             if src_null != tgt_null:
+                ot = src_kind.get(tbl.upper(), "TABLE")
                 details.append({
                     "source_schema": source_schema, "target_schema": target_schema,
                     "schema": sch, "table": tbl, "column": col,
@@ -347,7 +480,7 @@ class SchemaValidator(BaseValidator):
                     "element_path": element_path(source_schema or sch, tbl, col),
                     "error_code": "NULLABILITY_MISMATCH",
                     "error_description": "Nullable constraint mismatch",
-                    "object_type": "TABLE",
+                    "object_type": ot,
                 })
         passed = len(details) == 0
         return ValidationResult(
@@ -381,6 +514,7 @@ class SchemaValidator(BaseValidator):
                 details=[],
                 stats={},
             )
+        src_kind = self._table_kind_map(resolved_src, source=True)
         tgt_by_key: dict[tuple[str, str], dict[str, Any]] = {}
         for r in tgt_cols:
             tbl = str(r.get("table_name", "")).strip()
@@ -398,6 +532,7 @@ class SchemaValidator(BaseValidator):
             tdef = _norm_default_expr(tr.get("column_default"))
             if sdef == tdef:
                 continue
+            ot = src_kind.get(tbl.upper(), "TABLE")
             details.append({
                 "source_schema": source_schema,
                 "target_schema": target_schema,
@@ -408,7 +543,7 @@ class SchemaValidator(BaseValidator):
                 "element_path": element_path(source_schema or sch, tbl, col),
                 "error_code": "DEFAULT_MISMATCH",
                 "error_description": "Default value mismatch",
-                "object_type": "TABLE",
+                "object_type": ot,
                 "source_default": r.get("column_default"),
                 "target_default": tr.get("column_default"),
             })
@@ -451,6 +586,7 @@ class SchemaValidator(BaseValidator):
         src_tables = self._source_execute(src_d.catalog_tables_query(resolved_src, object_types))
         tgt_tables = self._target_execute(tgt_d.catalog_tables_query(target_schema, object_types))
         pairs = build_table_pairs_from_catalog_rows(src_tables, tgt_tables, source_schema, target_schema)
+        src_table_kind = self._table_kind_map(resolved_src, source=True)
 
         src_cc: dict[tuple[str, str], int] = {}
         for r in self._source_execute(src_d.catalog_columns_query(resolved_src, None)):
@@ -475,8 +611,9 @@ class SchemaValidator(BaseValidator):
             target_schema=target_schema,
             src_col_counts=src_cc,
             tgt_col_counts=tgt_cc,
+            source_table_kind=src_table_kind,
         )
-        bad = [d for d in details if d.get("status") in ("error", "WARNING")]
+        bad = [d for d in details if str(d.get("status") or "").strip().upper() in ("ERROR", "WARNING")]
         passed = len(bad) == 0
         return ValidationResult(
             validation_name="indexes",
@@ -573,8 +710,8 @@ class SchemaValidator(BaseValidator):
 
         def fk_key(r: dict[str, Any]) -> tuple[str, str]:
             t = str(r.get("table_name", "")).strip()
-            f = str(r.get("fk_name", "")).strip()
-            return (t.upper(), f.upper())
+            f = _fk_row_constraint_name_u(r)
+            return (t.upper(), f)
 
         src_map: dict[tuple[str, str], dict[str, Any]] = {fk_key(r): r for r in src_rows}
         tgt_map: dict[tuple[str, str], dict[str, Any]] = {fk_key(r): r for r in tgt_rows}
@@ -594,6 +731,9 @@ class SchemaValidator(BaseValidator):
             except Exception:
                 tgt_fk_cols = []
 
+        src_kind = self._table_kind_map(resolved_src, source=True)
+        tgt_kind = self._table_kind_map(target_schema, source=False)
+
         details: list[dict[str, Any]] = []
 
         def append_fk_detail(
@@ -604,26 +744,36 @@ class SchemaValidator(BaseValidator):
             err_desc: str,
             sr: dict[str, Any] | None,
             tr: dict[str, Any] | None,
+            element_fk: str | None = None,
         ) -> None:
-            tbl_u, fk_u = tbl.strip().upper(), fk.strip().upper()
+            tbl_u = tbl.strip().upper()
+            fk_elem = (element_fk or fk).strip()
+            fk_src_u = _fk_row_constraint_name_u(sr) if sr is not None else ""
+            fk_tgt_u = _fk_row_constraint_name_u(tr) if tr is not None else ""
             if status == "TARGET_ONLY":
                 path_sch = (target_schema or "").strip() or str((tr or {}).get("schema_name") or "")
                 row_schema = target_schema
             elif status == "SOURCE_ONLY":
                 path_sch = (source_schema or "").strip() or str((sr or {}).get("schema_name") or "")
                 row_schema = source_schema
-            else:
+            elif status in ("MISMATCH", "WARNING"):
                 path_sch = (source_schema or "").strip() or str((sr or {}).get("schema_name") or "")
                 row_schema = source_schema
-            elem = element_path(path_sch, tbl, fk)
+            elem = element_path(path_sch, tbl, fk_elem)
             sd_d, sd_u = ("", "")
             if sr is not None:
                 sd_d, sd_u = _fk_delete_update(sr, src_d.name)
             td_d, td_u = ("", "")
             if tr is not None:
                 td_d, td_u = _fk_delete_update(tr, tgt_d.name)
-            spairs = _fk_column_pair_string(src_fk_cols, tbl_u, fk_u)
-            tpairs = _fk_column_pair_string(tgt_fk_cols, tbl_u, fk_u)
+            spairs = _fk_column_pair_string(src_fk_cols, tbl_u, fk_src_u) if fk_src_u else ""
+            tpairs = _fk_column_pair_string(tgt_fk_cols, tbl_u, fk_tgt_u) if fk_tgt_u else ""
+            if status == "TARGET_ONLY":
+                ot = tgt_kind.get(tbl_u, "TABLE")
+            elif status == "SOURCE_ONLY":
+                ot = src_kind.get(tbl_u, "TABLE")
+            else:
+                ot = src_kind.get(tbl_u) or tgt_kind.get(tbl_u, "TABLE")
             details.append(
                 {
                     "source_schema": source_schema,
@@ -632,7 +782,7 @@ class SchemaValidator(BaseValidator):
                     "table": tbl,
                     "fk_name": fk,
                     "status": status,
-                    "object_type": "TABLE",
+                    "object_type": ot,
                     "element_path": elem,
                     "error_code": "FK_MISMATCH",
                     "error_description": err_desc,
@@ -649,44 +799,136 @@ class SchemaValidator(BaseValidator):
                 }
             )
 
+        consumed_src: set[tuple[str, str]] = set()
+        consumed_tgt: set[tuple[str, str]] = set()
+
+        def compare_fk_pair(
+            sr: dict[str, Any],
+            tr: dict[str, Any],
+            tbl: str,
+            tbl_u: str,
+            *,
+            from_signature_pair: bool = False,
+        ) -> bool:
+            """Return True if a mismatch or warning detail row was appended."""
+            spairs = _fk_column_pair_string(src_fk_cols, tbl_u, _fk_row_constraint_name_u(sr))
+            tpairs = _fk_column_pair_string(tgt_fk_cols, tbl_u, _fk_row_constraint_name_u(tr))
+            refs_ok = _fk_ref_tables_match(sr, tr, source_schema, target_schema, resolved_src)
+            ref_tbl_match = str(sr.get("ref_table") or "").strip().upper() == str(tr.get("ref_table") or "").strip().upper()
+            pairs_match = _normalize_fk_pairs_key(spairs) == _normalize_fk_pairs_key(tpairs)
+            sd_d, sd_u = _fk_delete_update(sr, src_d.name)
+            td_d, td_u = _fk_delete_update(tr, tgt_d.name)
+            actions_match = sd_d == td_d and sd_u == td_u
+            if refs_ok and pairs_match and actions_match:
+                return False
+            err_desc = _fk_mismatch_description(
+                refs_ok=refs_ok,
+                ref_table_match=ref_tbl_match,
+                pairs_match=pairs_match,
+                actions_match=actions_match,
+            )
+            out_status = "WARNING" if (from_signature_pair and err_desc == "Referenced table mismatch") else "MISMATCH"
+            display_fk = str(
+                tr.get("fk_name") or tr.get("constname") or sr.get("fk_name") or sr.get("constname") or ""
+            ).strip()
+            append_fk_detail(
+                tbl=tbl,
+                fk=display_fk,
+                status=out_status,
+                err_desc=err_desc,
+                sr=sr,
+                tr=tr,
+                element_fk=display_fk,
+            )
+            return True
+
         all_keys = set(src_map) | set(tgt_map)
         for k in sorted(all_keys):
             sr, tr = src_map.get(k), tgt_map.get(k)
             tbl = str((sr or tr or {}).get("table_name", "")).strip()
-            fk = str((sr or tr or {}).get("fk_name", "")).strip()
             tbl_u, fk_u = k
-            if sr is not None and tr is None:
-                append_fk_detail(tbl=tbl, fk=fk, status="SOURCE_ONLY", err_desc="FK missing in target", sr=sr, tr=None)
-            elif tr is not None and sr is None:
-                append_fk_detail(tbl=tbl, fk=fk, status="TARGET_ONLY", err_desc="FK missing in source", sr=None, tr=tr)
-            elif sr is not None and tr is not None:
-                spairs = _fk_column_pair_string(src_fk_cols, tbl_u, fk_u)
-                tpairs = _fk_column_pair_string(tgt_fk_cols, tbl_u, fk_u)
-                refs_ok = _fk_ref_tables_match(sr, tr, source_schema, target_schema)
-                sd_d, sd_u = _fk_delete_update(sr, src_d.name)
-                td_d, td_u = _fk_delete_update(tr, tgt_d.name)
-                if (
-                    not refs_ok
-                    or spairs.upper() != tpairs.upper()
-                    or sd_d != td_d
-                    or sd_u != td_u
-                ):
-                    append_fk_detail(
-                        tbl=tbl,
-                        fk=fk,
-                        status="MISMATCH",
-                        err_desc="Foreign key definition mismatch",
-                        sr=sr,
-                        tr=tr,
-                    )
+            if sr is not None and tr is not None:
+                consumed_src.add(fk_key(sr))
+                consumed_tgt.add(fk_key(tr))
+                compare_fk_pair(sr, tr, tbl, tbl_u, from_signature_pair=False)
 
-        passed = len(details) == 0
+        orphan_src = [r for r in src_rows if fk_key(r) not in consumed_src]
+        orphan_tgt = [r for r in tgt_rows if fk_key(r) not in consumed_tgt]
+        sig_used_src: set[tuple[str, str]] = set()
+        sig_used_tgt: set[tuple[str, str]] = set()
+
+        def _orphan_row_sig(r: dict[str, Any], is_src: bool) -> tuple[str, str, str]:
+            tbl_u = str(r.get("table_name", "")).strip().upper()
+            fk_u = _fk_row_constraint_name_u(r)
+            cols = src_fk_cols if is_src else tgt_fk_cols
+            return _fk_signature(tbl_u, fk_u, cols, r)
+
+        src_by_sig: dict[tuple[str, str, str], list[dict[str, Any]]] = defaultdict(list)
+        for sr in orphan_src:
+            src_by_sig[_orphan_row_sig(sr, True)].append(sr)
+        tgt_by_sig: dict[tuple[str, str, str], list[dict[str, Any]]] = defaultdict(list)
+        for tr in orphan_tgt:
+            tgt_by_sig[_orphan_row_sig(tr, False)].append(tr)
+
+        for sig in sorted(set(src_by_sig.keys()) & set(tgt_by_sig.keys())):
+            ls = sorted(src_by_sig[sig], key=_fk_row_constraint_name_u)
+            rs = sorted(tgt_by_sig[sig], key=_fk_row_constraint_name_u)
+            for sr, tr in zip(ls, rs):
+                sig_used_src.add(fk_key(sr))
+                sig_used_tgt.add(fk_key(tr))
+                tbl = str(sr.get("table_name") or tr.get("table_name") or "").strip()
+                tbl_u = tbl.upper()
+                compare_fk_pair(sr, tr, tbl, tbl_u, from_signature_pair=True)
+
+        loose_used_src: set[tuple[str, str]] = set()
+        loose_used_tgt: set[tuple[str, str]] = set()
+        rem_src = [sr for sr in orphan_src if fk_key(sr) not in sig_used_src]
+        rem_tgt = [tr for tr in orphan_tgt if fk_key(tr) not in sig_used_tgt]
+        loose_src: dict[tuple[str, str, frozenset[str]], list[dict[str, Any]]] = defaultdict(list)
+        for sr in rem_src:
+            loose_src[_fk_loose_bucket_key(sr, src_fk_cols)].append(sr)
+        loose_tgt: dict[tuple[str, str, frozenset[str]], list[dict[str, Any]]] = defaultdict(list)
+        for tr in rem_tgt:
+            loose_tgt[_fk_loose_bucket_key(tr, tgt_fk_cols)].append(tr)
+        for lk in sorted(set(loose_src.keys()) & set(loose_tgt.keys())):
+            ls = sorted(loose_src[lk], key=_fk_row_constraint_name_u)
+            rs = sorted(loose_tgt[lk], key=_fk_row_constraint_name_u)
+            for sr, tr in zip(ls, rs):
+                loose_used_src.add(fk_key(sr))
+                loose_used_tgt.add(fk_key(tr))
+                tbl = str(sr.get("table_name") or tr.get("table_name") or "").strip()
+                tbl_u = tbl.upper()
+                compare_fk_pair(sr, tr, tbl, tbl_u, from_signature_pair=True)
+        sig_used_src |= loose_used_src
+        sig_used_tgt |= loose_used_tgt
+
+        for sr in orphan_src:
+            if fk_key(sr) in sig_used_src:
+                continue
+            tbl = str(sr.get("table_name", "")).strip()
+            fk = str(sr.get("fk_name") or sr.get("constname") or "").strip()
+            append_fk_detail(tbl=tbl, fk=fk, status="SOURCE_ONLY", err_desc="FK missing in target", sr=sr, tr=None)
+
+        for tr in orphan_tgt:
+            if fk_key(tr) in sig_used_tgt:
+                continue
+            tbl = str(tr.get("table_name", "")).strip()
+            fk = str(tr.get("fk_name") or tr.get("constname") or "").strip()
+            append_fk_detail(tbl=tbl, fk=fk, status="TARGET_ONLY", err_desc="FK missing in source", sr=None, tr=tr)
+
+        hard = sum(
+            1
+            for d in details
+            if str(d.get("status", "")).upper() in ("MISMATCH", "SOURCE_ONLY", "TARGET_ONLY", "ERROR")
+        )
+        warn = sum(1 for d in details if str(d.get("status", "")).upper() == "WARNING")
+        passed = hard == 0
         return ValidationResult(
             validation_name="foreign_keys",
             passed=passed,
-            summary=f"Foreign keys: {len(details)} difference(s).",
+            summary=f"Foreign keys: {len(details)} row(s); {hard} error(s), {warn} warning(s).",
             details=details,
-            stats={"diff_count": len(details)},
+            stats={"diff_count": len(details), "error_count": hard, "warning_count": warn},
         )
 
     def validate_check_constraints(
@@ -716,6 +958,8 @@ class SchemaValidator(BaseValidator):
         tgt_map: dict[tuple[str, str], dict[str, Any]] = {ck_key(r): r for r in tgt_rows}
         log_src = (source_schema or "").strip()
         details: list[dict[str, Any]] = []
+        src_kind = self._table_kind_map(resolved_src, source=True)
+        tgt_kind = self._table_kind_map(target_schema, source=False)
 
         for k in sorted(set(src_map) | set(tgt_map)):
             sr, tr = src_map.get(k), tgt_map.get(k)
@@ -739,6 +983,7 @@ class SchemaValidator(BaseValidator):
                     tbl,
                     cname,
                 )
+            tbl_u = tbl.upper()
             if sr is not None and tr is None:
                 details.append(
                     {
@@ -748,7 +993,7 @@ class SchemaValidator(BaseValidator):
                         "table": tbl,
                         "constraint_name": cname,
                         "status": "SOURCE_ONLY",
-                        "object_type": "TABLE",
+                        "object_type": src_kind.get(tbl_u, "TABLE"),
                         "element_path": elem,
                         "error_code": "CHECK_CONSTRAINT_MISMATCH",
                         "error_description": "Check constraint missing in target",
@@ -764,7 +1009,7 @@ class SchemaValidator(BaseValidator):
                         "table": tbl,
                         "constraint_name": cname,
                         "status": "TARGET_ONLY",
-                        "object_type": "TABLE",
+                        "object_type": tgt_kind.get(tbl_u, "TABLE"),
                         "element_path": elem,
                         "error_code": "CHECK_CONSTRAINT_MISMATCH",
                         "error_description": "Check constraint missing in source",
@@ -781,7 +1026,7 @@ class SchemaValidator(BaseValidator):
                             "table": tbl,
                             "constraint_name": cname,
                             "status": "MISMATCH",
-                            "object_type": "TABLE",
+                            "object_type": src_kind.get(tbl_u) or tgt_kind.get(tbl_u, "TABLE"),
                             "element_path": elem,
                             "error_code": "CHECK_CONSTRAINT_MISMATCH",
                             "error_description": "Check constraint definition mismatch",

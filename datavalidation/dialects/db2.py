@@ -83,17 +83,34 @@ class DB2Dialect(SQLDialect):
         return " UNION ALL ".join(f"({p.strip()})" for p in parts) + " ORDER BY schema_name, table_name"
 
     def catalog_presence_sequences_query(self, schema: str | None) -> str | None:
-        """SEQUENCE presence: schema_name, object_name = SEQNAME, object_type = SEQUENCE."""
-        schema_cond = f"UPPER(SEQSCHEMA) = UPPER('{schema}')" if schema else "1=1"
+        """SEQUENCE presence: schema_name, object_name = SEQNAME, object_type = SEQUENCE.
+
+        Sequences listed in ``SYSCAT.COLIDENTATTRIBUTES`` back DB2 IDENTITY columns; on Azure SQL those
+        become ``IDENTITY`` columns, not ``sys.sequences``. Omitting them avoids false
+        ``PRESENCE_MISSING_IN_TARGET`` noise in DB2→Azure comparisons.
+        """
+        if schema:
+            s_esc = str(schema).strip().replace("'", "''")
+            schema_cond = f"UPPER(RTRIM(s.SEQSCHEMA)) = UPPER('{s_esc}')"
+        else:
+            schema_cond = "1=1"
         return f"""
-        SELECT RTRIM(SEQSCHEMA) AS schema_name, RTRIM(SEQNAME) AS object_name, 'SEQUENCE' AS object_type
-        FROM SYSCAT.SEQUENCES
+        SELECT RTRIM(s.SEQSCHEMA) AS schema_name, RTRIM(s.SEQNAME) AS object_name, 'SEQUENCE' AS object_type
+        FROM SYSCAT.SEQUENCES s
         WHERE {schema_cond}
+          AND NOT EXISTS (
+            SELECT 1 FROM SYSCAT.COLIDENTATTRIBUTES c
+            WHERE c.SEQID = s.SEQID
+          )
         ORDER BY schema_name, object_name
         """
 
     def catalog_presence_indexes_query(self, schema: str | None) -> str | None:
-        """INDEX presence: object_name = TABNAME.INDNAME; exclude primary/unique (P/U) to match old backend."""
+        """INDEX presence: object_name = TABNAME.INDNAME; exclude primary/unique (P/U) to match old backend.
+
+        Indexes on ``EXPLAIN_*`` tables (DB2 explain facility) are omitted: they are not application objects
+        and are not replicated on Azure SQL, so they would only produce false ``PRESENCE_MISSING_IN_TARGET`` rows.
+        """
         schema_cond = f"UPPER(INDSCHEMA) = UPPER('{schema}')" if schema else "1=1"
         return f"""
         SELECT RTRIM(INDSCHEMA) AS schema_name,
@@ -101,6 +118,7 @@ class DB2Dialect(SQLDialect):
                'INDEX' AS object_type
         FROM SYSCAT.INDEXES
         WHERE {schema_cond} AND UNIQUERULE NOT IN ('P', 'U')
+          AND UPPER(RTRIM(TABNAME)) NOT LIKE 'EXPLAIN\\_%' ESCAPE '\\'
         ORDER BY schema_name, object_name
         """
 

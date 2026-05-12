@@ -55,6 +55,12 @@ def _many_col_threshold() -> int:
         return 120
 
 
+def _detail_object_type_for_source_table(kind_map: dict[str, str] | None, src_tbl: str) -> str:
+    if not kind_map or not src_tbl:
+        return "TABLE"
+    return kind_map.get(_norm(src_tbl), "TABLE")
+
+
 def _normalize_src_ix_row(r: dict[str, Any], pair: dict[str, Any]) -> dict[str, Any] | None:
     sn = _norm(r.get("schema_name"))
     tn = _norm(r.get("table_name"))
@@ -136,6 +142,7 @@ def compare_indexes_legacy(
     target_schema: str | None,
     src_col_counts: dict[tuple[str, str], int],
     tgt_col_counts: dict[tuple[str, str], int],
+    source_table_kind: dict[str, str] | None = None,
 ) -> list[dict[str, Any]]:
     """
     Return ``details`` rows for ``ValidationResult`` (validation_name ``indexes``),
@@ -235,14 +242,16 @@ def compare_indexes_legacy(
             and missing_sysname_warn
             and (idx_uc.startswith("SQL") or idx_uc.startswith("PK"))
         )
+        # missing_src = (t_sig is None): index exists on source only → missing on target.
+        # missing_tgt = (s_sig is None): index exists on target only → missing on source.
         st = "WARNING" if (warn_order or warn_sys) else "error"
 
         if missing_src:
-            err_desc = "Index missing in source"
-            err_code = "INDEX_MISSING_IN_SOURCE"
-        elif missing_tgt:
             err_desc = "Index missing in target"
             err_code = "INDEX_MISSING_IN_TARGET"
+        elif missing_tgt:
+            err_desc = "Index missing in source"
+            err_code = "INDEX_MISSING_IN_SOURCE"
         elif (not cols_match) and cols_set_eq:
             err_desc = "Index column order mismatch"
             err_code = "INDEX_MISMATCH"
@@ -263,7 +272,7 @@ def compare_indexes_legacy(
             "schema": src_sch,
             "table": src_tbl,
             "index": idx_norm,
-            "object_type": "TABLE",
+            "object_type": _detail_object_type_for_source_table(source_table_kind, src_tbl),
             "status": st,
             "element_path": elem,
             "error_code": err_code,
@@ -303,7 +312,7 @@ def compare_indexes_legacy(
                 "schema": src_sch,
                 "table": src_tbl,
                 "index": "PRIMARY KEY",
-                "object_type": "TABLE",
+                "object_type": _detail_object_type_for_source_table(source_table_kind, src_tbl),
                 "status": "error",
                 "element_path": elem,
                 "error_code": "INDEX_MISMATCH",
@@ -322,7 +331,7 @@ def compare_indexes_legacy(
                 "schema": src_sch,
                 "table": src_tbl,
                 "index": "PRIMARY KEY",
-                "object_type": "TABLE",
+                "object_type": _detail_object_type_for_source_table(source_table_kind, src_tbl),
                 "status": "INFO",
                 "element_path": elem,
                 "error_code": "INDEX_MISMATCH",
@@ -354,7 +363,7 @@ def compare_indexes_legacy(
                 "schema": src_sch,
                 "table": src_tbl,
                 "index": "",
-                "object_type": "TABLE",
+                "object_type": _detail_object_type_for_source_table(source_table_kind, src_tbl),
                 "status": "INFO",
                 "element_path": f"{src_sch}.{src_tbl}",
                 "error_code": "INDEX_MISMATCH",

@@ -75,7 +75,10 @@ class AzureSQLDialect(SQLDialect):
         """
 
     def catalog_presence_indexes_query(self, schema: str | None) -> str | None:
-        """INDEX presence: object_name = TableName.IndexName; exclude hypothetical, PK, unique (match old backend)."""
+        """INDEX presence: object_name = TableName.IndexName; exclude hypothetical, PK, unique (match old backend).
+
+        Skip indexes on ``EXPLAIN_*`` tables so DB2↔Azure presence stays aligned when only DB2 has explain tables.
+        """
         schema_cond = self._schema_filter(schema)
         return f"""
         SELECT RTRIM(s.name) AS schema_name,
@@ -85,6 +88,7 @@ class AzureSQLDialect(SQLDialect):
         INNER JOIN sys.tables t ON i.object_id = t.object_id
         INNER JOIN sys.schemas s ON t.schema_id = s.schema_id
         WHERE {schema_cond} AND i.is_hypothetical = 0 AND i.name IS NOT NULL AND i.is_primary_key = 0 AND i.is_unique = 0
+          AND UPPER(RTRIM(t.name)) NOT LIKE 'EXPLAIN[_]%'
         ORDER BY schema_name, object_name
         """
 
@@ -118,20 +122,22 @@ class AzureSQLDialect(SQLDialect):
         schema_cond = self._schema_filter(schema)
         table_cond = "1=1"
         if table_name:
-            table_cond = f"t.name = N'{table_name.replace(chr(39), chr(39)+chr(39))}'"
+            esc = table_name.replace(chr(39), chr(39) + chr(39))
+            table_cond = f"o.name = N'{esc}'"
         return f"""
-        SELECT s.name AS schema_name, t.name AS table_name, c.name AS column_name,
+        SELECT s.name AS schema_name, o.name AS table_name, c.name AS column_name,
                ty.name AS data_type, c.max_length AS length, c.scale AS scale,
                c.is_nullable AS is_nullable,
                ISNULL(dc.definition, N'') AS column_default
         FROM sys.columns c
-        INNER JOIN sys.tables t ON c.object_id = t.object_id
-        INNER JOIN sys.schemas s ON t.schema_id = s.schema_id
+        INNER JOIN sys.objects o ON c.object_id = o.object_id
+            AND o.type IN ('U', 'V') AND o.is_ms_shipped = 0
+        INNER JOIN sys.schemas s ON o.schema_id = s.schema_id
         INNER JOIN sys.types ty ON c.user_type_id = ty.user_type_id
         LEFT JOIN sys.default_constraints dc
           ON dc.parent_object_id = c.object_id AND dc.parent_column_id = c.column_id
         WHERE {schema_cond} AND {table_cond}
-        ORDER BY s.name, t.name, c.column_id
+        ORDER BY s.name, o.name, c.column_id
         """
 
     def row_count_query(self, schema: str, table_name: str, dirty_read: bool = False) -> str:

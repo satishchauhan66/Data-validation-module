@@ -85,8 +85,7 @@ class TestDataValidators(unittest.TestCase):
 
         def tgt_exec(sql, params=None, timeout_seconds=None):
             u = sql.upper()
-            if "SYS.OBJECTS" in u and "SYS.SCHEMAS" in u:
-                return [{"schema_name": "dbo", "table_name": "T1", "object_type": "U"}]
+            # catalog_columns_query joins sys.columns + sys.objects + sys.types — match before table-list query
             if "SYS.COLUMNS" in u and "SYS.TYPES" in u:
                 return [
                     {
@@ -97,6 +96,8 @@ class TestDataValidators(unittest.TestCase):
                         "is_nullable": False,
                     }
                 ]
+            if "SYS.OBJECTS" in u and "SYS.SCHEMAS" in u:
+                return [{"schema_name": "dbo", "table_name": "T1", "object_type": "U"}]
             return []
 
         v = DataValidator(self.src, self.tgt, self.opts)
@@ -157,13 +158,13 @@ class TestDataValidators(unittest.TestCase):
 
         def tgt_exec(sql, params=None, timeout_seconds=None):
             u = sql.upper()
-            if "SYS.OBJECTS" in u and "SYS.SCHEMAS" in u:
-                return [{"schema_name": "dbo", "table_name": "T1", "object_type": "U"}]
             if "SYS.COLUMNS" in u and "JOIN SYS.TYPES" in u:
                 return [
                     {"schema_name": "dbo", "table_name": "T1", "column_name": "ID", "data_type": "int", "is_nullable": False},
                     {"schema_name": "dbo", "table_name": "T1", "column_name": "N1", "data_type": "varchar", "is_nullable": True},
                 ]
+            if "SYS.OBJECTS" in u and "SYS.SCHEMAS" in u:
+                return [{"schema_name": "dbo", "table_name": "T1", "object_type": "U"}]
             if "SYS.INDEX_COLUMNS" in u:
                 return [
                     {
