@@ -28,6 +28,25 @@ def _legacy_json_dumps(obj: Any) -> str:
     return json.dumps(obj, separators=(",", ":"), default=str)
 
 
+def _legacy_both_sides_table_context(
+    val_name: str,
+    d: dict[str, Any],
+    src_obj: str,
+    dest_obj: str,
+    src_sch: str,
+    dest_sch: str,
+) -> tuple[str, str, str, str]:
+    """FK / index / check rows are scoped to a child table that exists on both sides; keep both object + schema columns populated."""
+    if val_name not in ("foreign_keys", "indexes", "check_constraints"):
+        return src_obj, dest_obj, src_sch, dest_sch
+    tbl = (d.get("table") or "").strip()
+    if not tbl:
+        return src_obj, dest_obj, src_sch, dest_sch
+    ss = (d.get("source_schema") or "").strip()
+    ts = (d.get("target_schema") or "").strip()
+    return tbl, tbl, ss or src_sch, ts or dest_sch
+
+
 @dataclass
 class ValidationResult:
     """Result of a single validation (e.g. row counts, table presence)."""
@@ -154,6 +173,9 @@ class ValidationReport:
                 src_sch = src_schema if not is_target_only else ""
                 dest_obj = obj_name if not is_source_only else ""
                 dest_sch = tgt_schema if not is_source_only else ""
+                src_obj, dest_obj, src_sch, dest_sch = _legacy_both_sides_table_context(
+                    val_name, d, src_obj, dest_obj, src_sch, dest_sch
+                )
                 if val_name == "row_counts":
                     err_code = "ROW_COUNT_MISMATCH"
                     err_desc = "Found mismatch in row-count validation"
