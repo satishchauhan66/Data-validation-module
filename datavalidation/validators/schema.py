@@ -29,7 +29,8 @@ def _norm_default_expr(v: Any) -> str:
 
 
 def _db2_fk_delete_update(row: dict[str, Any]) -> tuple[str, str]:
-    mp = {"A": "NO_ACTION", "C": "CASCADE", "R": "RESTRICT", "N": "NO_ACTION", "L": "SET_NULL", "D": "SET_DEFAULT"}
+    # R (RESTRICT) → NO_ACTION: Azure SQL has no RESTRICT; migration tools convert it to NO_ACTION.
+    mp = {"A": "NO_ACTION", "C": "CASCADE", "R": "NO_ACTION", "N": "NO_ACTION", "L": "SET_NULL", "D": "SET_DEFAULT"}
     dc = str(row.get("delete_action") or "").strip().upper()
     uc = str(row.get("update_action") or "").strip().upper()
     return mp.get(dc, dc or "NO_ACTION"), mp.get(uc, uc or "NO_ACTION")
@@ -77,13 +78,31 @@ def _fk_row_constraint_name_u(r: dict[str, Any]) -> str:
     return str(v or "").strip().upper()
 
 
-def _fk_column_pair_string(col_rows: list[dict[str, Any]], table_u: str, fk_u: str) -> str:
+def _fk_col_rows_for_fk(col_rows: list[dict[str, Any]], table_u: str, fk_u: str) -> list[dict[str, Any]]:
+    """FK column catalog rows for ``(table_u, fk_u)``. Strict match first; then match by constraint name only when unambiguous."""
     fk_u = fk_u.strip().upper()
-    sub = [
+    tu = table_u.strip().upper()
+    strict = [
         r
         for r in col_rows
-        if str(r.get("table_name", "")).strip().upper() == table_u and _fk_row_constraint_name_u(r) == fk_u
+        if str(r.get("table_name", "")).strip().upper() == tu and _fk_row_constraint_name_u(r) == fk_u
     ]
+    if strict:
+        return strict
+    by_name = [r for r in col_rows if _fk_row_constraint_name_u(r) == fk_u]
+    if not by_name:
+        return []
+    distinct_tables = {str(r.get("table_name", "")).strip().upper() for r in by_name if str(r.get("table_name", "")).strip()}
+    if len(distinct_tables) <= 1:
+        return by_name
+    if tu in distinct_tables:
+        return [r for r in by_name if str(r.get("table_name", "")).strip().upper() == tu]
+    return []
+
+
+def _fk_column_pair_string(col_rows: list[dict[str, Any]], table_u: str, fk_u: str) -> str:
+    fk_u = fk_u.strip().upper()
+    sub = _fk_col_rows_for_fk(col_rows, table_u, fk_u)
 
     def seq_key(r: dict[str, Any]) -> int:
         raw = r.get("col_seq")
@@ -103,11 +122,7 @@ def _fk_column_pair_string(col_rows: list[dict[str, Any]], table_u: str, fk_u: s
 def _fk_ordered_fk_columns_key_only(col_rows: list[dict[str, Any]], table_u: str, fk_u: str) -> str:
     """Child-side FK column names in key order (excludes referenced PK names) for cross-dialect orphan pairing."""
     fk_u = fk_u.strip().upper()
-    sub = [
-        r
-        for r in col_rows
-        if str(r.get("table_name", "")).strip().upper() == table_u and _fk_row_constraint_name_u(r) == fk_u
-    ]
+    sub = _fk_col_rows_for_fk(col_rows, table_u, fk_u)
 
     def seq_key(r: dict[str, Any]) -> int:
         raw = r.get("col_seq")
@@ -131,11 +146,7 @@ def _fk_loose_bucket_key(
     ref_t = str(r.get("ref_table", "")).strip().upper()
     fk_u = _fk_row_constraint_name_u(r)
     names: list[str] = []
-    for row in fk_col_rows:
-        if str(row.get("table_name", "")).strip().upper() != tbl_u:
-            continue
-        if _fk_row_constraint_name_u(row) != fk_u:
-            continue
+    for row in _fk_col_rows_for_fk(fk_col_rows, tbl_u, fk_u):
         fc = str(row.get("fk_column", "") or "").strip().upper()
         if fc:
             names.append(fc)
@@ -176,6 +187,93 @@ def _fk_signature(tbl_u: str, fk_u: str, fk_col_rows: list[dict[str, Any]], row:
     ref_t = str(row.get("ref_table") or "").strip().upper()
     fk_only = _fk_ordered_fk_columns_key_only(fk_col_rows, tbl_u, fk_u)
     return (tbl_u, ref_t, _normalize_fk_pairs_key(fk_only))
+
+
+def _fk_common_prefix_len(a: str, b: str) -> int:
+    u, v = str(a or "").strip().upper(), str(b or "").strip().upper()
+    n = 0
+    for c1, c2 in zip(u, v):
+        if c1 != c2:
+            break
+        n += 1
+    return n
+
+
+def _fk_orphan_pair_sort_key(
+    sr: dict[str, Any],
+    tr: dict[str, Any],
+    tbl_u: str,
+    *,
+    src_fk_cols: list[dict[str, Any]],
+    tgt_fk_cols: list[dict[str, Any]],
+    source_schema: str | None,
+    target_schema: str | None,
+    resolved_src: str | None,
+    src_dialect: str,
+    tgt_dialect: str,
+) -> tuple[int, int, int]:
+    """Higher tuple is better for greedy FK orphan pairing (same child/ref/column signature, unequal counts)."""
+    su, tu = _fk_row_constraint_name_u(sr), _fk_row_constraint_name_u(tr)
+    spairs = _fk_column_pair_string(src_fk_cols, tbl_u, su)
+    tpairs = _fk_column_pair_string(tgt_fk_cols, tbl_u, tu)
+    refs_ok = _fk_ref_tables_match(sr, tr, source_schema, target_schema, resolved_src)
+    pairs_match = _normalize_fk_pairs_key(spairs) == _normalize_fk_pairs_key(tpairs)
+    sd_d, sd_u = _fk_delete_update(sr, src_dialect)
+    td_d, td_u = _fk_delete_update(tr, tgt_dialect)
+    actions_match = sd_d == td_d and sd_u == td_u
+    exact_name = 1 if su == tu else 0
+    score = 8 * int(refs_ok) + 4 * int(pairs_match) + 2 * int(actions_match)
+    cp = _fk_common_prefix_len(su, tu)
+    return (exact_name, score, cp)
+
+
+def _fk_greedy_orphan_pairs(
+    ls: list[dict[str, Any]],
+    rs: list[dict[str, Any]],
+    tbl_u: str,
+    *,
+    src_fk_cols: list[dict[str, Any]],
+    tgt_fk_cols: list[dict[str, Any]],
+    source_schema: str | None,
+    target_schema: str | None,
+    resolved_src: str | None,
+    src_dialect: str,
+    tgt_dialect: str,
+) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+    """Pair orphan FK headers when bucket sizes differ: prefer exact constraint name, then ref/column/action agreement."""
+    if not ls or not rs:
+        return []
+    ls_sorted = sorted(ls, key=_fk_row_constraint_name_u)
+    rs_sorted = sorted(rs, key=_fk_row_constraint_name_u)
+    if len(ls_sorted) == len(rs_sorted):
+        return list(zip(ls_sorted, rs_sorted))
+    edges: list[tuple[tuple[int, int, int], int, int]] = []
+    for i, sr in enumerate(ls_sorted):
+        for j, tr in enumerate(rs_sorted):
+            k = _fk_orphan_pair_sort_key(
+                sr,
+                tr,
+                tbl_u,
+                src_fk_cols=src_fk_cols,
+                tgt_fk_cols=tgt_fk_cols,
+                source_schema=source_schema,
+                target_schema=target_schema,
+                resolved_src=resolved_src,
+                src_dialect=src_dialect,
+                tgt_dialect=tgt_dialect,
+            )
+            edges.append((k, i, j))
+    edges.sort(key=lambda t: (-t[0][0], -t[0][1], -t[0][2], t[1], t[2]))
+    used_i: set[int] = set()
+    used_j: set[int] = set()
+    out: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    for _k, i, j in edges:
+        if i in used_i or j in used_j:
+            continue
+        out.append((ls_sorted[i], rs_sorted[j]))
+        used_i.add(i)
+        used_j.add(j)
+    return out
 
 
 def _fk_mismatch_description(
@@ -265,6 +363,7 @@ class SchemaValidator(BaseValidator):
 
         # SEQUENCE, INDEX, CONSTRAINT from presence-specific queries
         seen_src_keys = {(str(r.get("object_name", "")).strip().upper(), str(r.get("object_type", "")).strip().upper()) for r in src_rows}
+        identity_seq_parent: dict[str, str] = {}  # seq_name_upper -> parent_table_upper
         for kind, attr in [("SEQUENCE", "catalog_presence_sequences_query"), ("INDEX", "catalog_presence_indexes_query"), ("CONSTRAINT", "catalog_presence_constraints_query")]:
             if kind not in object_types:
                 continue
@@ -272,6 +371,10 @@ class SchemaValidator(BaseValidator):
                 q = getattr(src_d, attr, lambda s: None)(try_schema)
                 if q:
                     for r in self._source_execute(q):
+                        if kind == "SEQUENCE" and str(r.get("seq_type") or "").strip().upper() == "I":
+                            pt = str(r.get("parent_table") or "").strip().upper()
+                            if pt:
+                                identity_seq_parent[str(r.get("object_name") or r.get("table_name") or "").strip().upper()] = pt
                         nr = norm(r)
                         key = (nr["object_name"].upper(), nr["object_type"].upper())
                         if key not in seen_src_keys:
@@ -283,10 +386,23 @@ class SchemaValidator(BaseValidator):
                     tgt_rows.append(norm(r))
 
         def name_key(r: dict) -> tuple:
-            # Case-insensitive match so DB2 (uppercase) and Azure (mixed) object names match
             obj = str(r.get("object_name", "")).strip()
             typ = str(r.get("object_type", "TABLE")).strip().upper()
             return (obj.upper(), typ)
+
+        # Build target table set for identity sequence filtering
+        tgt_table_names = {str(r.get("object_name", "")).strip().upper()
+                          for r in tgt_rows
+                          if str(r.get("object_type", "")).strip().upper() == "TABLE"}
+
+        # Filter out identity sequences whose parent table exists on target (migrated as IDENTITY column)
+        if identity_seq_parent:
+            src_rows = [
+                r for r in src_rows
+                if not (str(r.get("object_type", "")).strip().upper() == "SEQUENCE"
+                        and r.get("object_name", "").strip().upper() in identity_seq_parent
+                        and identity_seq_parent[r.get("object_name", "").strip().upper()] in tgt_table_names)
+            ]
 
         src_by_key = {name_key(r): r for r in src_rows}
         tgt_by_key = {name_key(r): r for r in tgt_rows}
@@ -588,20 +704,35 @@ class SchemaValidator(BaseValidator):
         pairs = build_table_pairs_from_catalog_rows(src_tables, tgt_tables, source_schema, target_schema)
         src_table_kind = self._table_kind_map(resolved_src, source=True)
 
-        src_cc: dict[tuple[str, str], int] = {}
-        for r in self._source_execute(src_d.catalog_columns_query(resolved_src, None)):
-            k = (
-                str(r.get("schema_name") or "").strip().upper(),
-                str(r.get("table_name") or "").strip().upper(),
-            )
-            src_cc[k] = src_cc.get(k, 0) + 1
-        tgt_cc: dict[tuple[str, str], int] = {}
-        for r in self._target_execute(tgt_d.catalog_columns_query(target_schema, None)):
-            k = (
-                str(r.get("schema_name") or "").strip().upper(),
-                str(r.get("table_name") or "").strip().upper(),
-            )
-            tgt_cc[k] = tgt_cc.get(k, 0) + 1
+        def _build_col_counts(execute_fn, dialect, schema):
+            cc: dict[tuple[str, str], int] = {}
+            try:
+                for r in execute_fn(dialect.catalog_columns_query(schema, None)):
+                    k = (
+                        str(r.get("schema_name") or "").strip().upper(),
+                        str(r.get("table_name") or "").strip().upper(),
+                    )
+                    cc[k] = cc.get(k, 0) + 1
+            except Exception:
+                pass
+            if not cc and schema:
+                alt = getattr(dialect, "catalog_columns_query_by_creator", None)
+                if alt:
+                    try:
+                        for r in execute_fn(alt(schema)):
+                            k = (
+                                str(r.get("schema_name") or "").strip().upper(),
+                                str(r.get("table_name") or "").strip().upper(),
+                            )
+                            cc[k] = cc.get(k, 0) + 1
+                    except Exception:
+                        pass
+            return cc
+
+        src_cc = _build_col_counts(self._source_execute, src_d, resolved_src)
+        if not src_cc and source_schema and resolved_src != source_schema:
+            src_cc = _build_col_counts(self._source_execute, src_d, source_schema)
+        tgt_cc = _build_col_counts(self._target_execute, tgt_d, target_schema)
 
         details = compare_indexes_legacy(
             pairs,
@@ -871,14 +1002,26 @@ class SchemaValidator(BaseValidator):
             tgt_by_sig[_orphan_row_sig(tr, False)].append(tr)
 
         for sig in sorted(set(src_by_sig.keys()) & set(tgt_by_sig.keys())):
-            ls = sorted(src_by_sig[sig], key=_fk_row_constraint_name_u)
-            rs = sorted(tgt_by_sig[sig], key=_fk_row_constraint_name_u)
-            for sr, tr in zip(ls, rs):
+            ls = src_by_sig[sig]
+            rs = tgt_by_sig[sig]
+            tbl_u = sig[0]
+            for sr, tr in _fk_greedy_orphan_pairs(
+                ls,
+                rs,
+                tbl_u,
+                src_fk_cols=src_fk_cols,
+                tgt_fk_cols=tgt_fk_cols,
+                source_schema=source_schema,
+                target_schema=target_schema,
+                resolved_src=resolved_src,
+                src_dialect=src_d.name,
+                tgt_dialect=tgt_d.name,
+            ):
                 sig_used_src.add(fk_key(sr))
                 sig_used_tgt.add(fk_key(tr))
                 tbl = str(sr.get("table_name") or tr.get("table_name") or "").strip()
-                tbl_u = tbl.upper()
-                compare_fk_pair(sr, tr, tbl, tbl_u, from_signature_pair=True)
+                tbl_u_row = tbl.upper()
+                compare_fk_pair(sr, tr, tbl, tbl_u_row, from_signature_pair=True)
 
         loose_used_src: set[tuple[str, str]] = set()
         loose_used_tgt: set[tuple[str, str]] = set()
@@ -891,14 +1034,26 @@ class SchemaValidator(BaseValidator):
         for tr in rem_tgt:
             loose_tgt[_fk_loose_bucket_key(tr, tgt_fk_cols)].append(tr)
         for lk in sorted(set(loose_src.keys()) & set(loose_tgt.keys())):
-            ls = sorted(loose_src[lk], key=_fk_row_constraint_name_u)
-            rs = sorted(loose_tgt[lk], key=_fk_row_constraint_name_u)
-            for sr, tr in zip(ls, rs):
+            ls = loose_src[lk]
+            rs = loose_tgt[lk]
+            tbl_u = lk[0]
+            for sr, tr in _fk_greedy_orphan_pairs(
+                ls,
+                rs,
+                tbl_u,
+                src_fk_cols=src_fk_cols,
+                tgt_fk_cols=tgt_fk_cols,
+                source_schema=source_schema,
+                target_schema=target_schema,
+                resolved_src=resolved_src,
+                src_dialect=src_d.name,
+                tgt_dialect=tgt_d.name,
+            ):
                 loose_used_src.add(fk_key(sr))
                 loose_used_tgt.add(fk_key(tr))
                 tbl = str(sr.get("table_name") or tr.get("table_name") or "").strip()
-                tbl_u = tbl.upper()
-                compare_fk_pair(sr, tr, tbl, tbl_u, from_signature_pair=True)
+                tbl_u_row = tbl.upper()
+                compare_fk_pair(sr, tr, tbl, tbl_u_row, from_signature_pair=True)
         sig_used_src |= loose_used_src
         sig_used_tgt |= loose_used_tgt
 

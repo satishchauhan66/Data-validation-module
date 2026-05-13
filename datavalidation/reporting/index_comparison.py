@@ -50,9 +50,9 @@ def _parse_index_rules() -> tuple[bool, bool]:
 
 def _many_col_threshold() -> int:
     try:
-        return int(os.environ.get("DV_MANY_COLUMNS_THRESHOLD", "120"))
+        return int(os.environ.get("DV_MANY_COLUMNS_THRESHOLD", "250"))
     except Exception:
-        return 120
+        return 250
 
 
 def _detail_object_type_for_source_table(kind_map: dict[str, str] | None, src_tbl: str) -> str:
@@ -342,6 +342,19 @@ def compare_indexes_legacy(
                 "destination_unique": None,
             })
 
+    def _col_count_lookup(
+        counts: dict[tuple[str, str], int],
+        schema: str,
+        table: str,
+    ) -> int:
+        v = counts.get((schema, table))
+        if v is not None:
+            return v
+        for (s, t), c in counts.items():
+            if t == table:
+                return c
+        return 0
+
     # --- High column count note ---
     seen_many: set[tuple[str, str]] = set()
     for p in pairs:
@@ -349,8 +362,8 @@ def compare_indexes_legacy(
         if (js, jt) in seen_many:
             continue
         seen_many.add((js, jt))
-        sc = src_col_counts.get((js, jt), 0)
-        tc = tgt_col_counts.get((p["r_schema_norm"], p["r_object_norm"]), 0)
+        sc = _col_count_lookup(src_col_counts, js, jt)
+        tc = _col_count_lookup(tgt_col_counts, p["r_schema_norm"], p["r_object_norm"])
         mx = max(sc, tc)
         if mx >= many_thr:
             src_sch = source_schema or p.get("SourceSchemaName") or ""

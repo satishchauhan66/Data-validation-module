@@ -83,11 +83,13 @@ class DB2Dialect(SQLDialect):
         return " UNION ALL ".join(f"({p.strip()})" for p in parts) + " ORDER BY schema_name, table_name"
 
     def catalog_presence_sequences_query(self, schema: str | None) -> str | None:
-        """SEQUENCE presence: schema_name, object_name = SEQNAME, object_type = SEQUENCE.
+        """SEQUENCE presence: schema_name, object_name, object_type, seq_type, parent_table.
 
-        Sequences listed in ``SYSCAT.COLIDENTATTRIBUTES`` back DB2 IDENTITY columns; on Azure SQL those
-        become ``IDENTITY`` columns, not ``sys.sequences``. Omitting them avoids false
-        ``PRESENCE_MISSING_IN_TARGET`` noise in DB2→Azure comparisons.
+        Returns standalone (``SEQTYPE = 'S'``) and identity (``SEQTYPE = 'I'``) sequences.
+        ``seq_type`` and ``parent_table`` allow the Python layer to exclude identity sequences
+        whose parent table exists on the target (migrated as Azure ``IDENTITY`` columns).
+        Identity sequences whose parent table is **missing** on the target are kept so they
+        appear as ``PRESENCE_MISSING_IN_TARGET``.  Alias sequences (``SEQTYPE = 'A'``) are excluded.
         """
         if schema:
             s_esc = str(schema).strip().replace("'", "''")
@@ -95,13 +97,13 @@ class DB2Dialect(SQLDialect):
         else:
             schema_cond = "1=1"
         return f"""
-        SELECT RTRIM(s.SEQSCHEMA) AS schema_name, RTRIM(s.SEQNAME) AS object_name, 'SEQUENCE' AS object_type
+        SELECT RTRIM(s.SEQSCHEMA) AS schema_name, RTRIM(s.SEQNAME) AS object_name, 'SEQUENCE' AS object_type,
+               s.SEQTYPE AS seq_type,
+               RTRIM(c.TABNAME) AS parent_table
         FROM SYSCAT.SEQUENCES s
+        LEFT JOIN SYSCAT.COLIDENTATTRIBUTES c ON c.SEQID = s.SEQID
         WHERE {schema_cond}
-          AND NOT EXISTS (
-            SELECT 1 FROM SYSCAT.COLIDENTATTRIBUTES c
-            WHERE c.SEQID = s.SEQID
-          )
+          AND s.SEQTYPE IN ('S', 'I')
         ORDER BY schema_name, object_name
         """
 
@@ -144,6 +146,18 @@ class DB2Dialect(SQLDialect):
         FROM SYSCAT.COLUMNS C
         WHERE {schema_cond} AND {table_cond}
         ORDER BY C.TABSCHEMA, C.TABNAME, C.COLNO
+        """
+
+    def catalog_columns_query_by_creator(self, schema: str | None) -> str:
+        """Fallback column listing using SYSIBM.SYSCOLUMNS (TBCREATOR) when SYSCAT.COLUMNS (TABSCHEMA) returns nothing."""
+        creator_cond = self._creator_filter(schema).replace("CREATOR", "C.TBCREATOR")
+        return f"""
+        SELECT RTRIM(C.TBCREATOR) AS schema_name, RTRIM(C.TBNAME) AS table_name, RTRIM(C.NAME) AS column_name,
+               RTRIM(C.COLTYPE) AS data_type, C.LENGTH, C.SCALE, C.NULLS AS is_nullable,
+               RTRIM(CAST(C.DEFAULT AS VARCHAR(32000))) AS column_default
+        FROM SYSIBM.SYSCOLUMNS C
+        WHERE {creator_cond}
+        ORDER BY C.TBCREATOR, C.TBNAME, C.COLNO
         """
 
     def row_count_query(self, schema: str, table_name: str, dirty_read: bool = False) -> str:
@@ -217,7 +231,7 @@ class DB2Dialect(SQLDialect):
     def catalog_fk_query(self, schema: str | None) -> str:
         schema_cond = self._schema_filter(schema) if schema else "1=1"
         return f"""
-        SELECT RTRIM(REFKEYNAME) AS fk_name, RTRIM(TABSCHEMA) AS schema_name, RTRIM(TABNAME) AS table_name,
+        SELECT RTRIM(CONSTNAME) AS fk_name, RTRIM(TABSCHEMA) AS schema_name, RTRIM(TABNAME) AS table_name,
                RTRIM(REFTABSCHEMA) AS ref_schema, RTRIM(REFTABNAME) AS ref_table,
                RTRIM(DELETERULE) AS delete_action, RTRIM(UPDATERULE) AS update_action
         FROM SYSCAT.REFERENCES
@@ -229,11 +243,24 @@ class DB2Dialect(SQLDialect):
             return None
         s = str(schema).strip().replace("'", "''")
         return f"""
-        SELECT RTRIM(k.CONSTNAME) AS fk_name, RTRIM(k.FKTABSCHEMA) AS schema_name, RTRIM(k.FKTABNAME) AS table_name,
-               k.KEYSEQ AS col_seq, RTRIM(k.FKCOLNAME) AS fk_column, RTRIM(k.PKCOLNAME) AS pk_column
-        FROM SYSCAT.REFKEYCOLUSE k
-        WHERE UPPER(RTRIM(k.FKTABSCHEMA)) = UPPER('{s}')
-        ORDER BY k.FKTABSCHEMA, k.FKTABNAME, k.CONSTNAME, k.KEYSEQ
+        SELECT RTRIM(fk.CONSTNAME) AS fk_name,
+               RTRIM(ref.TABSCHEMA) AS schema_name,
+               RTRIM(ref.TABNAME) AS table_name,
+               fk.COLSEQ AS col_seq,
+               RTRIM(fk.COLNAME) AS fk_column,
+               RTRIM(pk.COLNAME) AS pk_column
+        FROM SYSCAT.REFERENCES ref
+        JOIN SYSCAT.KEYCOLUSE fk
+          ON fk.TABSCHEMA = ref.TABSCHEMA
+         AND fk.TABNAME = ref.TABNAME
+         AND fk.CONSTNAME = ref.CONSTNAME
+        LEFT JOIN SYSCAT.KEYCOLUSE pk
+          ON pk.TABSCHEMA = ref.REFTABSCHEMA
+         AND pk.TABNAME = ref.REFTABNAME
+         AND pk.CONSTNAME = ref.REFKEYNAME
+         AND pk.COLSEQ = fk.COLSEQ
+        WHERE UPPER(RTRIM(ref.TABSCHEMA)) = UPPER('{s}')
+        ORDER BY ref.TABSCHEMA, ref.TABNAME, ref.CONSTNAME, fk.COLSEQ
         """
 
     def catalog_check_constraints_query(self, schema: str | None) -> str:
