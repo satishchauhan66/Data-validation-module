@@ -1,3 +1,4 @@
-# Pinned to the v2.1.0 release tag. After `git push origin v2.1.0`, use:
+# Install latest from main branch:
 #   pip install -r requirements-from-github.txt
-datavalidation @ git+https://github.com/satishchauhan66/Data-validation-module.git@v2.1.0
+# To force upgrade to latest: pip install --upgrade --force-reinstall -r requirements-from-github.txt
+datavalidation @ git+https://github.com/satishchauhan66/Data-validation-module.git@main
