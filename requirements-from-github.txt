@@ -1,4 +1,7 @@
 # Install latest from main branch:
-#   pip install -r requirements-from-github.txt
-# To force upgrade to latest: pip install --upgrade --force-reinstall -r requirements-from-github.txt
-datavalidation @ git+https://github.com/satishchauhan66/Data-validation-module.git@main
+#   pip install --no-cache-dir -r requirements-from-github.txt
+#
+# To upgrade an existing install to the latest:
+#   pip install --upgrade --force-reinstall --no-cache-dir -r requirements-from-github.txt
+#
+https://github.com/satishchauhan66/Data-validation-module/archive/refs/heads/main.zip
