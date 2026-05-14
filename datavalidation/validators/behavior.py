@@ -402,6 +402,7 @@ class BehaviorValidator(BaseValidator):
             if lv is None and rv is None:
                 continue
             if lv != rv:
+                src_kind = self._table_kind_map(resolved_src, source=True)
                 details.append({
                     "source_schema": source_schema,
                     "target_schema": target_schema,
@@ -409,7 +410,7 @@ class BehaviorValidator(BaseValidator):
                     "table": tbl,
                     "status": "MISMATCH",
                     "element_path": f"{source_schema}.{tbl}",
-                    "object_type": "TABLE",
+                    "object_type": src_kind.get(_norm_upper(tbl), "TABLE"),
                     "error_code": "EXTENDED_PROPERTY_MISMATCH",
                     "error_description": "Table description / extended property differs",
                     "details_json": json.dumps({"source": lv, "target": rv}),

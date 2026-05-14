@@ -87,7 +87,27 @@ class DataValidator(BaseValidator):
         self._columns_catalog_cache: dict[tuple[str, str], list[dict[str, Any]]] = {}
         self._index_catalog_cache: dict[tuple[str, str], list[dict[str, Any]]] = {}
         self._pair_tables_cache: dict[tuple[str, str, tuple[str, ...]], tuple[str, list[str]]] = {}
+        self._kind_map_cache: dict[tuple[str, bool], dict[str, str]] = {}
         self._catalog_lock = threading.Lock()
+
+    def _table_kind_map(self, resolved_schema: str | None, *, source: bool) -> dict[str, str]:
+        """Cached version — avoids repeated catalog round-trips within one DataValidator run."""
+        key = ((resolved_schema or "").strip(), source)
+        with self._catalog_lock:
+            hit = self._kind_map_cache.get(key)
+        if hit is not None:
+            return hit
+        result = super()._table_kind_map(resolved_schema, source=source)
+        with self._catalog_lock:
+            self._kind_map_cache[key] = result
+        return result
+
+    def _obj_type(self, tbl: str, resolved_src: str | None, target_schema: str | None) -> str:
+        """Look up TABLE vs VIEW for a table name using cached kind maps."""
+        tbl_u = str(tbl).strip().upper()
+        src_kind = self._table_kind_map(resolved_src, source=True) if resolved_src else {}
+        tgt_kind = self._table_kind_map(target_schema, source=False) if target_schema else {}
+        return src_kind.get(tbl_u) or tgt_kind.get(tbl_u, "TABLE")
 
     def _data_query_timeout_seconds(self) -> int | None:
         """Cap for DISTINCT/CHECKSUM/FK/null/constraint queries so work cannot hang forever (locks, huge scans).
@@ -443,7 +463,7 @@ class DataValidator(BaseValidator):
                 "schema": sch, "table": tbl, "status": "SOURCE_ONLY",
                 "source_count": cnt, "target_count": None,
                 "element_path": f"{sch}.{tbl}",
-                "object_type": "TABLE",
+                "object_type": self._obj_type(tbl, resolved_src, target_schema),
                 "count_method": used,
                 "source_bytes_estimate": _stats(src_stats, tbl)[1],
                 "error": err,
@@ -462,7 +482,7 @@ class DataValidator(BaseValidator):
                 "schema": sch, "table": tbl, "status": "TARGET_ONLY",
                 "source_count": None, "target_count": cnt,
                 "element_path": f"{sch}.{tbl}",
-                "object_type": "TABLE",
+                "object_type": self._obj_type(tbl, resolved_src, target_schema),
                 "count_method": used,
                 "target_bytes_estimate": _stats(tgt_stats, tbl)[1],
                 "error": err,
@@ -480,7 +500,7 @@ class DataValidator(BaseValidator):
                     "schema": source_schema, "table": tbl, "status": "SKIPPED",
                     "source_count": None, "target_count": None,
                     "element_path": f"{source_schema}.{tbl}",
-                    "object_type": "TABLE",
+                    "object_type": self._obj_type(tbl, resolved_src, target_schema),
                     "count_method": "skip",
                     "source_bytes_estimate": sb, "target_bytes_estimate": tb,
                     "error": None,
@@ -501,7 +521,7 @@ class DataValidator(BaseValidator):
                     "schema": source_schema, "table": tbl, "status": "MISMATCH",
                     "source_count": src_cnt, "target_count": tgt_cnt,
                     "element_path": f"{source_schema}.{tbl}",
-                    "object_type": "TABLE",
+                    "object_type": self._obj_type(tbl, resolved_src, target_schema),
                     "count_method": src_used if src_used == tgt_used else f"{src_used}/{tgt_used}",
                     "source_bytes_estimate": sb, "target_bytes_estimate": tb,
                     "error": src_err or tgt_err,
@@ -663,7 +683,7 @@ class DataValidator(BaseValidator):
                         "column": str(_row_get(lr, "column_name")),
                         "status": "METADATA_MISMATCH",
                         "element_path": f"{source_schema}.{tbl}.{_row_get(lr, 'column_name')}",
-                        "object_type": "TABLE",
+                        "object_type": self._obj_type(tbl, resolved_src, target_schema),
                         "error_code": "NULLABILITY_METADATA_MISMATCH",
                         "error_description": "Nullability differs between catalogs",
                         "source_nullable": ln,
@@ -692,7 +712,7 @@ class DataValidator(BaseValidator):
                         "column": lcn,
                         "status": "ERROR",
                         "element_path": f"{source_schema}.{tbl}.{lcn}",
-                        "object_type": "TABLE",
+                        "object_type": self._obj_type(tbl, resolved_src, target_schema),
                         "error_code": "AGG_QUERY_FAILED",
                         "error_description": "Could not compute null counts for column",
                     })
@@ -713,7 +733,7 @@ class DataValidator(BaseValidator):
                         "column": lcn,
                         "status": "MISMATCH",
                         "element_path": f"{source_schema}.{tbl}.{lcn}",
-                        "object_type": "TABLE",
+                        "object_type": self._obj_type(tbl, resolved_src, target_schema),
                         "error_code": "NULL_COUNT_MISMATCH",
                         "error_description": "Column-level null count differs",
                         "source_null_count": null_l,
@@ -795,7 +815,7 @@ class DataValidator(BaseValidator):
                         "table": tbl,
                         "status": "ERROR",
                         "element_path": ep,
-                        "object_type": "TABLE",
+                        "object_type": self._obj_type(tbl, resolved_src, target_schema),
                         "error_code": "KEY_NOT_FOUND",
                         "error_description": "No primary key detected on either side",
                         "details_json": json.dumps({"key_columns": []}),
@@ -822,7 +842,7 @@ class DataValidator(BaseValidator):
                         "table": tbl,
                         "status": "ERROR",
                         "element_path": ep,
-                        "object_type": "TABLE",
+                        "object_type": self._obj_type(tbl, resolved_src, target_schema),
                         "error_code": "COUNT_FAILED",
                         "error_description": f"Count failed: {ex}",
                         "details_json": json.dumps({"key_columns": key_cols.split(",")}),
@@ -830,6 +850,7 @@ class DataValidator(BaseValidator):
                 return
             dj_base = {"key_columns": key_cols.split(",")}
             rows_to_add: list[dict[str, Any]] = []
+            ot = self._obj_type(tbl, resolved_src, target_schema)
             if s_dist < s_rows:
                 rows_to_add.append({
                     "source_schema": source_schema,
@@ -838,7 +859,7 @@ class DataValidator(BaseValidator):
                     "table": tbl,
                     "status": "MISMATCH",
                     "element_path": ep,
-                    "object_type": "TABLE",
+                    "object_type": ot,
                     "error_code": "DUPLICATES_IN_SOURCE",
                     "error_description": "Duplicates detected in source on key",
                     "details_json": json.dumps({**dj_base, "source_row_count": s_rows, "source_distinct_key_count": s_dist}),
@@ -851,7 +872,7 @@ class DataValidator(BaseValidator):
                     "table": tbl,
                     "status": "MISMATCH",
                     "element_path": ep,
-                    "object_type": "TABLE",
+                    "object_type": ot,
                     "error_code": "DUPLICATES_IN_TARGET",
                     "error_description": "Duplicates detected in target on key",
                     "details_json": json.dumps({**dj_base, "target_row_count": t_rows, "target_distinct_key_count": t_dist}),
@@ -864,7 +885,7 @@ class DataValidator(BaseValidator):
                     "table": tbl,
                     "status": "MISMATCH",
                     "element_path": ep,
-                    "object_type": "TABLE",
+                    "object_type": ot,
                     "error_code": "DISTINCT_COUNT_MISMATCH",
                     "error_description": "Distinct key count differs between source and target",
                     "details_json": json.dumps({
@@ -1002,7 +1023,7 @@ class DataValidator(BaseValidator):
                     "table": tbl,
                     "status": "ERROR",
                     "element_path": f"{source_schema}.{tbl}",
-                    "object_type": "TABLE",
+                    "object_type": self._obj_type(tbl, resolved_src, target_schema),
                     "error_code": "CHECKSUM_FAILED",
                     "error_description": str(ex),
                     "details_json": json.dumps({"columns": cols}),
@@ -1016,7 +1037,7 @@ class DataValidator(BaseValidator):
                     "table": tbl,
                     "status": "MISMATCH",
                     "element_path": f"{source_schema}.{tbl}",
-                    "object_type": "TABLE",
+                    "object_type": self._obj_type(tbl, resolved_src, target_schema),
                     "error_code": "AGG_CHECKSUM_MISMATCH",
                     "error_description": "Aggregate checksum differs",
                     "details_json": json.dumps({"columns": cols, "source_checksum": str(a), "target_checksum": str(b)}),
@@ -1068,7 +1089,7 @@ class DataValidator(BaseValidator):
                     "table": tbl,
                     "status": "SKIP",
                     "element_path": f"{source_schema}.{tbl}",
-                    "object_type": "TABLE",
+                    "object_type": self._obj_type(tbl, resolved_src, target_schema),
                     "error_code": "ROW_HASH_NO_PK",
                     "error_description": "Row-hash checksum requires a primary key; skipped.",
                     "details_json": json.dumps({}),
@@ -1102,7 +1123,7 @@ class DataValidator(BaseValidator):
                     "table": tbl,
                     "status": "ERROR",
                     "element_path": f"{source_schema}.{tbl}",
-                    "object_type": "TABLE",
+                    "object_type": self._obj_type(tbl, resolved_src, target_schema),
                     "error_code": "ROW_HASH_SQL_UNAVAILABLE",
                     "error_description": "Dialect does not support row fingerprint SQL.",
                     "details_json": json.dumps({"key_columns": key_cols}),
@@ -1123,7 +1144,7 @@ class DataValidator(BaseValidator):
                     "table": tbl,
                     "status": "ERROR",
                     "element_path": f"{source_schema}.{tbl}",
-                    "object_type": "TABLE",
+                    "object_type": self._obj_type(tbl, resolved_src, target_schema),
                     "error_code": "ROW_HASH_QUERY_FAILED",
                     "error_description": str(ex),
                     "details_json": json.dumps({"key_columns": key_cols, "value_columns": val_cols}),
@@ -1133,6 +1154,7 @@ class DataValidator(BaseValidator):
             ms = self._hash_map_from_rows(rs)
             mt = self._hash_map_from_rows(rt)
             emitted = 0
+            ot = self._obj_type(tbl, resolved_src, target_schema)
 
             for k in sorted(set(ms.keys()) - set(mt.keys())):
                 if emitted >= max_bad:
@@ -1145,7 +1167,7 @@ class DataValidator(BaseValidator):
                     "table": tbl,
                     "status": "MISMATCH",
                     "element_path": f"{source_schema}.{tbl}",
-                    "object_type": "TABLE",
+                    "object_type": ot,
                     "error_code": "MISSING_IN_TARGET",
                     "error_description": "Key present only in source (row checksum)",
                     "details_json": json.dumps({"key_columns": key_cols, "key": k}),
@@ -1161,7 +1183,7 @@ class DataValidator(BaseValidator):
                     "table": tbl,
                     "status": "MISMATCH",
                     "element_path": f"{source_schema}.{tbl}",
-                    "object_type": "TABLE",
+                    "object_type": ot,
                     "error_code": "MISSING_IN_SOURCE",
                     "error_description": "Key present only in target (row checksum)",
                     "details_json": json.dumps({"key_columns": key_cols, "key": k}),
@@ -1178,7 +1200,7 @@ class DataValidator(BaseValidator):
                         "table": tbl,
                         "status": "MISMATCH",
                         "element_path": f"{source_schema}.{tbl}",
-                        "object_type": "TABLE",
+                        "object_type": ot,
                         "error_code": "ROW_HASH_MISMATCH",
                         "error_description": "Row hash mismatch",
                         "details_json": json.dumps({"key_columns": key_cols, "key": k}),
@@ -1372,7 +1394,7 @@ class DataValidator(BaseValidator):
                         "table": s_table,
                         "status": "MISMATCH",
                         "element_path": f"{cn}.{ct}.{g.get('fk_name','')}",
-                        "object_type": "TABLE",
+                        "object_type": self._obj_type(s_table, resolved_src, target_schema),
                         "error_code": err,
                         "error_description": f"Child rows without matching parent: {n}",
                         "details_json": json.dumps({
@@ -1456,7 +1478,7 @@ class DataValidator(BaseValidator):
                             "table": tbl,
                             "status": "MISMATCH",
                             "element_path": f"{source_schema}.{tbl}.{cn}",
-                            "object_type": "TABLE",
+                            "object_type": self._obj_type(tbl, resolved_src, target_schema),
                             "error_code": "NOT_NULL_VIOLATION_IN_SOURCE",
                             "error_description": f"Non-nullable column has NULLs: {n}",
                             "details_json": json.dumps({"column_name": cn}),
@@ -1477,7 +1499,7 @@ class DataValidator(BaseValidator):
                             "table": tbl,
                             "status": "MISMATCH",
                             "element_path": f"{target_schema}.{tbl}.{cn}",
-                            "object_type": "TABLE",
+                            "object_type": self._obj_type(tbl, resolved_src, target_schema),
                             "error_code": "NOT_NULL_VIOLATION_IN_TARGET",
                             "error_description": f"Non-nullable column has NULLs: {n}",
                             "details_json": json.dumps({"column_name": cn}),
@@ -1502,7 +1524,7 @@ class DataValidator(BaseValidator):
                             "table": tbl,
                             "status": "MISMATCH",
                             "element_path": f"{source_schema}.{tbl}.{cname}",
-                            "object_type": "TABLE",
+                            "object_type": self._obj_type(tbl, resolved_src, target_schema),
                             "error_code": "CHECK_VIOLATION_IN_SOURCE",
                             "error_description": f"Check constraint violated: {n}",
                             "details_json": json.dumps({"constraint_name": cname, "expression": expr}),
@@ -1526,7 +1548,7 @@ class DataValidator(BaseValidator):
                             "table": tbl,
                             "status": "MISMATCH",
                             "element_path": f"{target_schema}.{tbl}.{cname}",
-                            "object_type": "TABLE",
+                            "object_type": self._obj_type(tbl, resolved_src, target_schema),
                             "error_code": "CHECK_VIOLATION_IN_TARGET",
                             "error_description": f"Check constraint violated: {n}",
                             "details_json": json.dumps({"constraint_name": cname, "expression": expr}),
@@ -1548,7 +1570,7 @@ class DataValidator(BaseValidator):
                             "table": tbl,
                             "status": "MISMATCH",
                             "element_path": f"{source_schema}.{tbl}.{cn}",
-                            "object_type": "TABLE",
+                            "object_type": self._obj_type(tbl, resolved_src, target_schema),
                             "error_code": "LENGTH_EXCEEDED_IN_SOURCE",
                             "error_description": f"Values exceed length {lim}: {n}",
                             "details_json": json.dumps({"column_name": cn, "max_length": lim}),
@@ -1570,7 +1592,7 @@ class DataValidator(BaseValidator):
                             "table": tbl,
                             "status": "MISMATCH",
                             "element_path": f"{target_schema}.{tbl}.{cn}",
-                            "object_type": "TABLE",
+                            "object_type": self._obj_type(tbl, resolved_src, target_schema),
                             "error_code": "LENGTH_EXCEEDED_IN_TARGET",
                             "error_description": f"Values exceed length {lim}: {n}",
                             "details_json": json.dumps({"column_name": cn, "max_length": lim}),

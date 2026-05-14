@@ -12,7 +12,7 @@ from datavalidation.reporting.index_comparison import compare_indexes_legacy
 from datavalidation.results import ValidationResult
 from datavalidation.utils.formatting import element_path
 from datavalidation.rules.datatype_map import is_compatible_type
-from datavalidation.validators.base import BaseValidator
+from datavalidation.validators.base import BaseValidator, _catalog_object_type_label
 
 
 def _norm_whitespace_upper(s: Any) -> str:
@@ -52,16 +52,6 @@ def _fk_delete_update(row: dict[str, Any], dialect_name: str) -> tuple[str, str]
     if dialect_name == "db2":
         return _db2_fk_delete_update(row)
     return _azure_fk_delete_update(row)
-
-
-def _catalog_object_type_label(raw: Any) -> str:
-    """Normalize SYSIBM.SYSTABLES / sys.objects type codes (or names) to TABLE or VIEW for reporting."""
-    u = str(raw if raw is not None else "").strip().upper()
-    if u in ("T", "U", "TABLE"):
-        return "TABLE"
-    if u in ("V", "VIEW"):
-        return "VIEW"
-    return u or "TABLE"
 
 
 def _normalize_fk_pairs_key(pairs: str) -> str:
@@ -294,21 +284,6 @@ def _fk_mismatch_description(
 
 class SchemaValidator(BaseValidator):
     """Runs all schema-level validations."""
-
-    def _table_kind_map(self, resolved_schema: str | None, *, source: bool) -> dict[str, str]:
-        """Uppercase table/view name -> TABLE or VIEW (queries both kinds for accurate labels)."""
-        dialect = self._source_dialect if source else self._target_dialect
-        execute = self._source_execute if source else self._target_execute
-        out: dict[str, str] = {}
-        try:
-            rows = execute(dialect.catalog_tables_query(resolved_schema, ["TABLE", "VIEW"])) or []
-        except Exception:
-            return out
-        for r in rows:
-            t = str(r.get("table_name", "")).strip().upper()
-            if t:
-                out[t] = _catalog_object_type_label(r.get("object_type"))
-        return out
 
     def validate_table_presence(
         self,

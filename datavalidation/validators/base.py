@@ -11,6 +11,16 @@ from datavalidation.dialects import get_dialect
 from datavalidation.results import ValidationResult
 
 
+def _catalog_object_type_label(raw: Any) -> str:
+    """Normalize DB2 TYPE codes (T/V) and Azure sys.objects type codes (U/V) to TABLE or VIEW."""
+    u = str(raw if raw is not None else "").strip().upper()
+    if u in ("T", "U", "TABLE"):
+        return "TABLE"
+    if u in ("V", "VIEW"):
+        return "VIEW"
+    return u or "TABLE"
+
+
 class BaseValidator(ABC):
     """Base class for schema, data, and behavior validators."""
 
@@ -74,6 +84,21 @@ class BaseValidator(ABC):
             return adapter.execute(sql, params, timeout_seconds=timeout_seconds)
         except TypeError:
             return adapter.execute(sql, params)
+
+    def _table_kind_map(self, resolved_schema: str | None, *, source: bool) -> dict[str, str]:
+        """Uppercase table/view name -> TABLE or VIEW."""
+        dialect = self._source_dialect if source else self._target_dialect
+        execute = self._source_execute if source else self._target_execute
+        out: dict[str, str] = {}
+        try:
+            rows = execute(dialect.catalog_tables_query(resolved_schema, ["TABLE", "VIEW"])) or []
+        except Exception:
+            return out
+        for r in rows:
+            t = str(r.get("table_name", "")).strip().upper()
+            if t:
+                out[t] = _catalog_object_type_label(r.get("object_type"))
+        return out
 
     def close(self) -> None:
         if self._source_adapter:
