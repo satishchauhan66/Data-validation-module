@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "datavalidation"
-version = "2.2.0"
+version = "2.2.1"
 description = "Lightweight Python library for DB2-to-Azure and Azure-to-Azure migration validation"
 readme = "README.md"
 license = { text = "MIT" }
@@ -57,4 +57,4 @@ where = ["."]
 include = ["datavalidation*"]
 
 [tool.setuptools.package-data]
-datavalidation = ["drivers/README.md"]
+datavalidation = ["drivers/README.md", "drivers/db2jcc4.jar"]

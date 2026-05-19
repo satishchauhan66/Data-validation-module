@@ -3,10 +3,44 @@ DB2 connection adapter using ibm_db_sa (SQLAlchemy) or JDBC (jaydebeapi) fallbac
 When ibm_db is not available (e.g. no native DB2 client on Windows), uses packed
 JDBC driver from datavalidation/drivers (or auto-downloaded).
 """
+import os
 from typing import Any
 
 from datavalidation.config import ConnectionConfig
 from datavalidation.connectors.base import ConnectionAdapter
+
+
+def _is_ibm_db_native_error(exc: BaseException) -> bool:
+    """True when the native ibm_db driver cannot load (missing DLL, import_dbapi, etc.)."""
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        msg = str(cur).lower()
+        if isinstance(cur, (ImportError, OSError)):
+            if any(k in msg for k in ("ibm_db", "dll", "load failed", "import_dbapi", "module could not be found")):
+                return True
+        if "can't load plugin" in msg and "ibm_db" in msg:
+            return True
+        cur = cur.__cause__ or cur.__context__  # type: ignore[assignment]
+    return False
+
+
+def _prefer_jdbc_only() -> bool:
+    """Skip native ibm_db when JDBC is the reliable path (Windows, frozen exe, or explicit env)."""
+    import sys
+
+    env = os.environ.get("DV_DB2_USE_JDBC", "").strip().lower()
+    if env in ("1", "true", "yes"):
+        return True
+    if env in ("0", "false", "no"):
+        return False
+    # Default: no IBM CLI install on typical Windows / packaged apps — use bundled JDBC jar.
+    if getattr(sys, "frozen", False):
+        return True
+    if sys.platform == "win32":
+        return True
+    return False
 
 
 def _build_db2_url(config: ConnectionConfig) -> str:
@@ -27,30 +61,8 @@ class DB2Adapter(ConnectionAdapter):
         super().__init__(config)
         self._use_jdbc = False
 
-    def connect(self) -> None:
-        if self._engine is not None or self._connection is not None:
-            return
-        # 1) Try native ibm_db (SQLAlchemy)
-        try:
-            from sqlalchemy import create_engine
-            url = _build_db2_url(self.config)
-            self._engine = create_engine(url, pool_pre_ping=True, pool_size=2, max_overflow=2)
-            return
-        except ImportError as e:
-            err = str(e).lower()
-            if "ibm_db" not in err and "dll" not in err and "load" not in err:
-                raise
-        except OSError as e:
-            if "DLL" not in str(e) and "module" not in str(e).lower():
-                raise
-        except Exception as e:
-            # SQLAlchemy raises NoSuchModuleError when db2+ibm_db dialect isn't installed — fall back to JDBC.
-            msg = str(e).lower()
-            if "can't load plugin" in msg and "ibm_db" in msg:
-                pass
-            else:
-                raise
-        # 2) Fallback: JDBC (packed driver in drivers/ or auto-download)
+    def _connect_jdbc(self) -> None:
+        """JDBC path: packed driver in drivers/ or auto-downloaded; requires Java (JRE)."""
         try:
             from datavalidation.connectors.db2_jdbc import connect_db2_jdbc, ensure_db2_jdbc_driver
         except ImportError:
@@ -61,8 +73,8 @@ class DB2Adapter(ConnectionAdapter):
         jar_path = ensure_db2_jdbc_driver()
         if not jar_path:
             raise ImportError(
-                "DB2 JDBC driver (db2jcc4.jar) not found. Place it in the package 'drivers' folder "
-                "or set DB2_JDBC_DRIVER_PATH. The library can also auto-download it if Java is installed."
+                "DB2 JDBC driver (db2jcc4.jar) not found. Reinstall datavalidation to restore the "
+                "bundled driver, or allow auto-download when Java and network are available."
             )
         port = self.config.port or 50000
         try:
@@ -87,6 +99,32 @@ class DB2Adapter(ConnectionAdapter):
                 ) from e
             raise
         self._use_jdbc = True
+
+    def connect(self) -> None:
+        if self._engine is not None or self._connection is not None:
+            return
+        native_ok = False
+        if not _prefer_jdbc_only():
+            # 1) Try native ibm_db (SQLAlchemy). create_engine is lazy; probe connect() so DLL errors fall back.
+            engine = None
+            try:
+                from sqlalchemy import create_engine
+                url = _build_db2_url(self.config)
+                engine = create_engine(url, pool_pre_ping=True, pool_size=2, max_overflow=2)
+                with engine.connect():
+                    pass
+                self._engine = engine
+                native_ok = True
+            except Exception as e:
+                if not _is_ibm_db_native_error(e):
+                    raise
+                if engine is not None:
+                    try:
+                        engine.dispose()
+                    except Exception:
+                        pass
+        if not native_ok:
+            self._connect_jdbc()
 
     def execute(
         self,

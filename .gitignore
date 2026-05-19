@@ -39,8 +39,9 @@ azure_database_config.json
 *.local.yaml
 *.local.json
 
-# DB2 JDBC jars (auto-downloaded or copied locally; keep drivers/*.py and README)
+# DB2 JDBC jars (auto-downloaded locally; bundled jar is committed under datavalidation/drivers/)
 *.jar
+!datavalidation/drivers/db2jcc4.jar
 
 # JVM / JPype crash dumps (often under examples/ when running quickstart)
 hs_err_pid*.log

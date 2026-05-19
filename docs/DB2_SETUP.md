@@ -17,19 +17,28 @@ This installs:
 1. **Native (ibm_db)**  
    Tries first. Needs [IBM Data Server Driver / DB2 client](https://www.ibm.com/support/pages/getting-started-ibm-data-server-drivers) installed on the machine. On Windows this often means installing the full client.
 
-2. **JDBC fallback (packed driver)**  
-   If the native driver is not available (e.g. on Windows without DB2 client), the library uses JDBC:
-   - **Java (JRE)** must be installed.
-   - **DB2 JDBC JAR** is taken from:
-     - Package `drivers` folder: `datavalidation/drivers/` (e.g. place `db2jcc4.jar` there when building or shipping your app), or
-     - Auto-download on first use to that folder or to `~/.datavalidation/drivers/`.
+2. **JDBC (bundled driver, default on Windows)**  
+   `db2jcc4.jar` is included in the pip package under `datavalidation/drivers/`. No user configuration is required.
+   - **Java (JRE)** must be installed on the machine (64-bit if your app is 64-bit).
+   - On Windows and PyInstaller builds, the library skips native `ibm_db` and uses JDBC automatically.
 
-So you can “pack” DB2 support like in the Azure Migration Tool: put `db2jcc4.jar` in the `drivers` folder next to the `datavalidation` package (or rely on auto-download). No need to install the native IBM DB2 client when using the JDBC path.
+Auto-download to `~/.datavalidation/drivers` only runs if the bundled jar is missing (e.g. incomplete source checkout).
 
-## Packing the driver for distribution
+## PyInstaller / DB2 Migration Tool
 
-- **Option A:** Add `db2jcc4.jar` (or equivalent) into `datavalidation/drivers/` before building/packaging your app. The library will find it there.
-- **Option B:** Rely on auto-download on first run (requires network and write access to the drivers dir or `~/.datavalidation/drivers`).
-- **Option C:** Set `DB2_JDBC_DRIVER_PATH` to the directory that contains the JAR.
+Include package data in your spec so the jar is extracted next to the app:
 
-JAR can be obtained from [Maven Central (IBM DB2 JCC)](https://mvnrepository.com/artifact/com.ibm.db2/jcc) or your IBM product install.
+- `datavalidation/drivers/db2jcc4.jar`
+- `jaydebeapi`, `jpype1`
+
+The library resolves the jar via `importlib.resources`, the package `drivers/` folder, and `sys._MEIPASS` when frozen.
+
+## Windows: `DLL load failed while importing ibm_db`
+
+The Python package `ibm_db` is only a wrapper; it needs IBM’s native **Data Server Driver / CLIDriver** DLLs on the machine (`db2cli.dll`, etc.). Packaged apps (e.g. PyInstaller) often ship `ibm_db` without those DLLs, which produces:
+
+`ImportError: DLL load failed while importing ibm_db: The specified module could not be found.`
+
+**Recommended:** `pip install datavalidation` (includes `db2jcc4.jar`) and install **Java JRE**. On Windows, JDBC is used by default.
+
+**Alternative:** install [IBM Data Server Driver Package](https://www.ibm.com/support/pages/download-initial-version-115-clidriver-and-odbc-driver) and set `DV_DB2_USE_JDBC=0` to force native `ibm_db` on Windows.
