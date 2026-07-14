@@ -37,7 +37,7 @@ def _legacy_both_sides_table_context(
     dest_sch: str,
 ) -> tuple[str, str, str, str]:
     """FK / index / check rows are scoped to a child table that exists on both sides; keep both object + schema columns populated."""
-    if val_name not in ("foreign_keys", "indexes", "check_constraints"):
+    if val_name not in ("foreign_keys", "indexes", "check_constraints", "default_values"):
         return src_obj, dest_obj, src_sch, dest_sch
     tbl = (d.get("table") or "").strip()
     if not tbl:
@@ -183,29 +183,107 @@ class ValidationReport:
                         {"source_row_count": d.get("source_count"), "destination_row_count": d.get("target_count")}
                     )
                 elif val_name == "table_presence":
-                    err_code = "PRESENCE_MISSING_IN_TARGET" if is_source_only else ("PRESENCE_MISSING_IN_SOURCE" if is_target_only else "PRESENCE_DIFFERENCE")
-                    err_desc = "Object exists in source but not in target" if is_source_only else ("Object exists in Azure SQL but not in DB2" if is_target_only else d.get("error_description", ""))
-                    details_json = _legacy_json_dumps({
-                        "object_type": obj_type,
-                        "change_type": "MISSING_IN_TARGET" if is_source_only else ("MISSING_IN_SOURCE" if is_target_only else "DIFFERENCE"),
-                        "source_schema_name": src_sch,
-                        "source_object_name": src_obj,
-                        "destination_schema_name": dest_sch,
-                        "destination_object_name": dest_obj,
-                    })
+                    if raw_st == "INFO":
+                        err_code = d.get("error_code") or "IDENTITY_SEQUENCE_REMAPPED"
+                        err_desc = d.get("error_description") or (
+                            "DB2 identity sequence maps to Azure IDENTITY column"
+                        )
+                        map_body = d.get("mapping") if isinstance(d.get("mapping"), dict) else {
+                            "trace": "identity_sequence_mapped_to_azure_identity_column",
+                            "source_object_name": src_obj,
+                            "destination_object_name": dest_obj,
+                        }
+                        details_json = _legacy_json_dumps(map_body)
+                        parent = ""
+                        if isinstance(d.get("mapping"), dict):
+                            parent = str(
+                                (d["mapping"].get("destination") or {}).get("table")
+                                or (d["mapping"].get("source_of_truth") or {}).get("table")
+                                or ""
+                            ).strip()
+                        if parent:
+                            dest_obj = parent
+                            dest_sch = tgt_schema or dest_sch
+                    elif raw_st == "MISMATCH" and d.get("error_code"):
+                        # e.g. IDENTITY_COLUMN_MISSING_ON_TARGET — keep error + mapping proof
+                        err_code = d.get("error_code")
+                        err_desc = d.get("error_description") or "Presence mismatch"
+                        map_body = d.get("mapping") if isinstance(d.get("mapping"), dict) else None
+                        if map_body:
+                            details_json = _legacy_json_dumps(map_body)
+                            parent = str(
+                                (map_body.get("destination") or {}).get("table")
+                                or (map_body.get("source_of_truth") or {}).get("table")
+                                or ""
+                            ).strip()
+                            if parent:
+                                dest_obj = parent
+                                dest_sch = tgt_schema or dest_sch
+                        else:
+                            details_json = _legacy_json_dumps({
+                                "object_type": obj_type,
+                                "change_type": "DIFFERENCE",
+                                "source_schema_name": src_sch,
+                                "source_object_name": src_obj,
+                                "destination_schema_name": dest_sch,
+                                "destination_object_name": dest_obj,
+                            })
+                    else:
+                        err_code = "PRESENCE_MISSING_IN_TARGET" if is_source_only else ("PRESENCE_MISSING_IN_SOURCE" if is_target_only else "PRESENCE_DIFFERENCE")
+                        err_desc = "Object exists in source but not in target" if is_source_only else ("Object exists in Azure SQL but not in DB2" if is_target_only else d.get("error_description", ""))
+                        details_json = _legacy_json_dumps({
+                            "object_type": obj_type,
+                            "change_type": "MISSING_IN_TARGET" if is_source_only else ("MISSING_IN_SOURCE" if is_target_only else "DIFFERENCE"),
+                            "source_schema_name": src_sch,
+                            "source_object_name": src_obj,
+                            "destination_schema_name": dest_sch,
+                            "destination_object_name": dest_obj,
+                        })
                 else:
                     err_code = d.get("error_code")
                     err_desc = d.get("error_description", "")
                     details_json = None
                     if validation_type == "default_values":
-                        if status != "warning":
-                            status = "warning"
-                        err_code = err_code or "DEFAULT_MISMATCH"
-                        err_desc = err_desc or "Default value difference (treated as warning)"
+                        # INFO = equivalent definition (names may differ). MISMATCH stays error.
+                        if raw_st == "INFO":
+                            status = "info"
+                        elif raw_st in ("MISMATCH", "SOURCE_ONLY", "TARGET_ONLY", "ERROR"):
+                            status = "error"
+                        err_code = err_code or (
+                            "DEFAULT_NAME_REMAPPED" if raw_st == "INFO" else "DEFAULT_MISMATCH"
+                        )
+                        err_desc = err_desc or (
+                            "Default exists on both sides with equivalent definition "
+                            "(constraint names may differ; treated as info)"
+                            if raw_st == "INFO"
+                            else "Default value mismatch"
+                        )
+                        map_body = d.get("mapping")
+                        if not isinstance(map_body, dict):
+                            map_body = {
+                                "trace": "column_default_paired_by_table_and_column",
+                                "source_of_truth": {
+                                    "schema": src_sch,
+                                    "table": src_obj,
+                                    "column": d.get("column"),
+                                    "constraint_name": d.get("source_constraint_name"),
+                                    "default_expression": d.get("source_default"),
+                                },
+                                "destination": {
+                                    "schema": dest_sch,
+                                    "table": dest_obj,
+                                    "column": d.get("column"),
+                                    "constraint_name": d.get("destination_constraint_name"),
+                                    "default_expression": d.get("target_default"),
+                                },
+                            }
                         details_json = _legacy_json_dumps({
                             "column_name": d.get("column"),
                             "source_default": d.get("source_default"),
                             "destination_default": d.get("target_default"),
+                            "source_constraint_name": d.get("source_constraint_name"),
+                            "destination_constraint_name": d.get("destination_constraint_name"),
+                            "mapping": map_body,
                         })
                     elif validation_type == "foreign_keys":
                         err_code = err_code or "FK_MISMATCH"
@@ -272,15 +350,18 @@ class ValidationReport:
                         )
                         sc = d.get("source_columns")
                         dc = d.get("destination_columns")
-                        details_json = _legacy_json_dumps({
+                        body: dict[str, Any] = {
                             "index_name": d.get("index"),
+                            "destination_index_name": d.get("destination_index"),
                             "source_columns": sc,
                             "destination_columns": dc,
-                            "source_cols": sc,
-                            "destination_cols": dc,
                             "source_unique": d.get("source_unique"),
                             "destination_unique": d.get("destination_unique"),
-                        })
+                            "index_kind": d.get("index_kind"),
+                        }
+                        if isinstance(d.get("mapping"), dict):
+                            body["mapping"] = d["mapping"]
+                        details_json = _legacy_json_dumps({k: v for k, v in body.items() if v is not None})
                     else:
                         err_code = err_code or "MISMATCH"
                     if details_json is None:

@@ -173,6 +173,11 @@ For reports (e.g. `validate_schema()`): `report.results`, `report.all_passed`, `
 
 - Python 3.10+
 - **Azure SQL:** ODBC Driver 18 for SQL Server (install from [Microsoft](https://learn.microsoft.com/en-us/sql/connect/odbc/download-odbc-driver-for-sql-server) if needed).
-- **DB2:** The library uses native driver first; if unavailable (e.g. Windows), it falls back to JDBC and auto-downloads the driver. For the JDBC path, Java (JRE) must be installed.
+- **DB2:** Bundled JDBC jar (`db2jcc4.jar`) ships with the package. On Windows / frozen apps JDBC is preferred; native `ibm_db` is used when available. Java (JRE) is required for the JDBC path.
+
+## Change tracking
+
+- `docs/module_changes_tracker.csv` — living log of module behavior/packaging changes (Connectivity, Defaults, Catalog, Report format). Append a new `ChangeID` for each intentional change.
+- `docs/validation_rules_changelog.csv` — detailed validation **rules** (`R001`…`R020`) with root cause and fix notes.
 
 See `docs/LIBRARY_ARCHITECTURE.md` for full architecture.

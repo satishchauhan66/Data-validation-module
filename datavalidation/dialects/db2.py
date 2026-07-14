@@ -83,13 +83,13 @@ class DB2Dialect(SQLDialect):
         return " UNION ALL ".join(f"({p.strip()})" for p in parts) + " ORDER BY schema_name, table_name"
 
     def catalog_presence_sequences_query(self, schema: str | None) -> str | None:
-        """SEQUENCE presence: schema_name, object_name, object_type, seq_type, parent_table.
+        """SEQUENCE presence: schema_name, object_name, object_type, seq_type, parent_table, parent_column.
 
         Returns standalone (``SEQTYPE = 'S'``) and identity (``SEQTYPE = 'I'``) sequences.
-        ``seq_type`` and ``parent_table`` allow the Python layer to exclude identity sequences
-        whose parent table exists on the target (migrated as Azure ``IDENTITY`` columns).
-        Identity sequences whose parent table is **missing** on the target are kept so they
-        appear as ``PRESENCE_MISSING_IN_TARGET``.  Alias sequences (``SEQTYPE = 'A'``) are excluded.
+        ``seq_type`` / ``parent_table`` / ``parent_column`` let the Python layer map identity
+        sequences to Azure ``IDENTITY`` columns (via SYSCAT.COLIDENTATTRIBUTES) and treat
+        remapped ones as INFO instead of PRESENCE_MISSING_IN_TARGET.
+        Alias sequences (``SEQTYPE = 'A'``) are excluded.
         """
         if schema:
             s_esc = str(schema).strip().replace("'", "''")
@@ -98,8 +98,9 @@ class DB2Dialect(SQLDialect):
             schema_cond = "1=1"
         return f"""
         SELECT RTRIM(s.SEQSCHEMA) AS schema_name, RTRIM(s.SEQNAME) AS object_name, 'SEQUENCE' AS object_type,
-               s.SEQTYPE AS seq_type,
-               RTRIM(c.TABNAME) AS parent_table
+               RTRIM(CAST(s.SEQTYPE AS CHAR(1))) AS seq_type,
+               RTRIM(c.TABNAME) AS parent_table,
+               RTRIM(c.COLNAME) AS parent_column
         FROM SYSCAT.SEQUENCES s
         LEFT JOIN SYSCAT.COLIDENTATTRIBUTES c ON c.SEQID = s.SEQID
         WHERE {schema_cond}
@@ -140,9 +141,10 @@ class DB2Dialect(SQLDialect):
         schema_cond = self._schema_filter(schema).replace("TABSCHEMA", "C.TABSCHEMA")
         table_cond = "1=1" if not table_name else f"C.TABNAME = '{table_name.upper()}'"
         return f"""
-        SELECT C.TABSCHEMA AS schema_name, C.TABNAME AS table_name, C.COLNAME AS column_name,
-               C.TYPENAME AS data_type, C.LENGTH, C.SCALE, C.NULLS AS is_nullable,
-               RTRIM(CAST(C.DEFAULT AS VARCHAR(32000))) AS column_default
+        SELECT RTRIM(C.TABSCHEMA) AS schema_name, RTRIM(C.TABNAME) AS table_name, RTRIM(C.COLNAME) AS column_name,
+               RTRIM(C.TYPENAME) AS data_type, C.LENGTH AS length, C.SCALE AS scale, RTRIM(C.NULLS) AS is_nullable,
+               RTRIM(CAST(C.DEFAULT AS VARCHAR(32000))) AS column_default,
+               CASE WHEN C.DEFAULT IS NOT NULL THEN 'COLUMN_DEFAULT' ELSE '' END AS default_constraint_name
         FROM SYSCAT.COLUMNS C
         WHERE {schema_cond} AND {table_cond}
         ORDER BY C.TABSCHEMA, C.TABNAME, C.COLNO
@@ -154,7 +156,8 @@ class DB2Dialect(SQLDialect):
         return f"""
         SELECT RTRIM(C.TBCREATOR) AS schema_name, RTRIM(C.TBNAME) AS table_name, RTRIM(C.NAME) AS column_name,
                RTRIM(C.COLTYPE) AS data_type, C.LENGTH, C.SCALE, C.NULLS AS is_nullable,
-               RTRIM(CAST(C.DEFAULT AS VARCHAR(32000))) AS column_default
+               RTRIM(CAST(C.DEFAULT AS VARCHAR(32000))) AS column_default,
+               CASE WHEN C.DEFAULT IS NOT NULL THEN 'COLUMN_DEFAULT' ELSE '' END AS default_constraint_name
         FROM SYSIBM.SYSCOLUMNS C
         WHERE {creator_cond}
         ORDER BY C.TBCREATOR, C.TBNAME, C.COLNO

@@ -74,6 +74,21 @@ class AzureSQLDialect(SQLDialect):
         ORDER BY schema_name, object_name
         """
 
+    def catalog_identity_columns_query(self, schema: str | None) -> str | None:
+        """Azure IDENTITY columns: table_name, column_name (for mapping DB2 identity sequences)."""
+        schema_cond = self._schema_filter(schema)
+        return f"""
+        SELECT RTRIM(s.name) AS schema_name,
+               RTRIM(t.name) AS table_name,
+               RTRIM(c.name) AS column_name,
+               CAST(1 AS int) AS is_identity
+        FROM sys.columns c
+        INNER JOIN sys.tables t ON c.object_id = t.object_id
+        INNER JOIN sys.schemas s ON t.schema_id = s.schema_id
+        WHERE {schema_cond} AND c.is_identity = 1
+        ORDER BY s.name, t.name, c.name
+        """
+
     def catalog_presence_indexes_query(self, schema: str | None) -> str | None:
         """INDEX presence: object_name = TableName.IndexName; exclude hypothetical, PK, unique (match old backend).
 
@@ -93,7 +108,12 @@ class AzureSQLDialect(SQLDialect):
         """
 
     def catalog_presence_constraints_query(self, schema: str | None) -> str | None:
-        """CONSTRAINT presence: key_constraints (non-PK) + check + default; object_name = TableName.ConstraintName."""
+        """CONSTRAINT presence: key_constraints (non-PK) + check only.
+
+        Default constraints (``DF__*``) are omitted: DB2 stores column defaults as column
+        attributes (not named TABCONST rows), so name presence would always flag Azure DF__
+        objects as TARGET_ONLY. Equivalence is reported under ``default_values`` as INFO.
+        """
         schema_cond = self._schema_filter(schema)
         q1 = f"""
         SELECT RTRIM(s.name) AS schema_name, RTRIM(t.name) + '.' + RTRIM(kc.name) AS object_name, 'CONSTRAINT' AS object_type
@@ -109,14 +129,7 @@ class AzureSQLDialect(SQLDialect):
         INNER JOIN sys.schemas s ON t.schema_id = s.schema_id
         WHERE {schema_cond}
         """
-        q3 = f"""
-        SELECT RTRIM(s.name) AS schema_name, RTRIM(t.name) + '.' + RTRIM(dc.name) AS object_name, 'CONSTRAINT' AS object_type
-        FROM sys.default_constraints dc
-        INNER JOIN sys.tables t ON dc.parent_object_id = t.object_id
-        INNER JOIN sys.schemas s ON t.schema_id = s.schema_id
-        WHERE {schema_cond}
-        """
-        return f"({q1}) UNION ALL ({q2}) UNION ALL ({q3}) ORDER BY schema_name, object_name"
+        return f"({q1}) UNION ALL ({q2}) ORDER BY schema_name, object_name"
 
     def catalog_columns_query(self, schema: str | None, table_name: str | None) -> str:
         schema_cond = self._schema_filter(schema)
@@ -128,7 +141,8 @@ class AzureSQLDialect(SQLDialect):
         SELECT s.name AS schema_name, o.name AS table_name, c.name AS column_name,
                ty.name AS data_type, c.max_length AS length, c.scale AS scale,
                c.is_nullable AS is_nullable,
-               ISNULL(dc.definition, N'') AS column_default
+               ISNULL(dc.definition, N'') AS column_default,
+               ISNULL(dc.name, N'') AS default_constraint_name
         FROM sys.columns c
         INNER JOIN sys.objects o ON c.object_id = o.object_id
             AND o.type IN ('U', 'V') AND o.is_ms_shipped = 0

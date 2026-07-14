@@ -15,17 +15,75 @@ from datavalidation.rules.datatype_map import is_compatible_type
 from datavalidation.validators.base import BaseValidator, _catalog_object_type_label
 
 
+def _catalog_row_schema(r: dict[str, Any]) -> str:
+    return str(
+        r.get("schema_name") or r.get("tabschema") or r.get("tbcreator") or r.get("creator") or ""
+    ).strip()
+
+
+def _catalog_row_table(r: dict[str, Any]) -> str:
+    return str(r.get("table_name") or r.get("tabname") or r.get("tbname") or "").strip()
+
+
+def _catalog_row_column(r: dict[str, Any]) -> str:
+    return str(r.get("column_name") or r.get("colname") or r.get("name") or "").strip()
+
+
 def _norm_whitespace_upper(s: Any) -> str:
     return " ".join(str(s or "").strip().upper().split())
 
 
 def _norm_default_expr(v: Any) -> str:
+    """Normalize catalog default expressions for cross-engine equivalence (DB2 ↔ Azure SQL)."""
     if v is None:
         return ""
     s = str(v).strip()
     if not s or s.upper() in ("-", "NULL", "(NULL)"):
         return ""
-    return " ".join(s.upper().split())
+    s = " ".join(s.upper().split())
+    # Unwrap nested parentheses: ((0)) → 0, (SYSDATETIME()) → SYSDATETIME()
+    while len(s) >= 2 and s.startswith("(") and s.endswith(")"):
+        inner = s[1:-1].strip()
+        if not inner:
+            break
+        s = inner
+    # N'' / '' empty strings
+    if s in ("''", "N''", '""', "N\"\""):
+        return "__EMPTY_STR__"
+    # Current timestamp / datetime defaults
+    now_aliases = {
+        "CURRENT TIMESTAMP",
+        "CURRENT_TIMESTAMP",
+        "CURRENT TIMESTAMP()",
+        "CURRENT_TIMESTAMP()",
+        "SYSDATETIME()",
+        "SYSUTCDATETIME()",
+        "GETDATE()",
+        "GETUTCDATE()",
+        "CURRENT_TIMESTAMP",
+    }
+    if s in now_aliases or s.startswith("CURRENT TIMESTAMP"):
+        return "__NOW__"
+    # Empty blob / binary defaults (DB2 BLOB('') ↔ Azure 0x)
+    if s in ("0X", "0X0") or "BLOB" in s and "''" in s.replace(" ", ""):
+        return "__EMPTY_BLOB__"
+    # Strip surrounding quotes for string literals so 'N' and N match
+    if (s.startswith("'") and s.endswith("'")) or (s.startswith("N'") and s.endswith("'")):
+        body = s[2:-1] if s.startswith("N'") else s[1:-1]
+        return f"STR:{body}"
+    # Numeric: strip trailing .0
+    try:
+        f = float(s)
+        if f == int(f):
+            return str(int(f))
+        return str(f)
+    except ValueError:
+        pass
+    return s
+
+
+def _defaults_equivalent(source_default: Any, target_default: Any) -> bool:
+    return _norm_default_expr(source_default) == _norm_default_expr(target_default)
 
 
 def _db2_fk_delete_update(row: dict[str, Any]) -> tuple[str, str]:
@@ -338,7 +396,8 @@ class SchemaValidator(BaseValidator):
 
         # SEQUENCE, INDEX, CONSTRAINT from presence-specific queries
         seen_src_keys = {(str(r.get("object_name", "")).strip().upper(), str(r.get("object_type", "")).strip().upper()) for r in src_rows}
-        identity_seq_parent: dict[str, str] = {}  # seq_name_upper -> parent_table_upper
+        # seq_name_upper -> {parent_table, parent_column, schema}
+        identity_seq_meta: dict[str, dict[str, str]] = {}
         for kind, attr in [("SEQUENCE", "catalog_presence_sequences_query"), ("INDEX", "catalog_presence_indexes_query"), ("CONSTRAINT", "catalog_presence_constraints_query")]:
             if kind not in object_types:
                 continue
@@ -346,10 +405,20 @@ class SchemaValidator(BaseValidator):
                 q = getattr(src_d, attr, lambda s: None)(try_schema)
                 if q:
                     for r in self._source_execute(q):
-                        if kind == "SEQUENCE" and str(r.get("seq_type") or "").strip().upper() == "I":
-                            pt = str(r.get("parent_table") or "").strip().upper()
-                            if pt:
-                                identity_seq_parent[str(r.get("object_name") or r.get("table_name") or "").strip().upper()] = pt
+                        if kind == "SEQUENCE":
+                            seq_type = str(
+                                r.get("seq_type") or r.get("seqtype") or ""
+                            ).strip().upper()
+                            if seq_type == "I":
+                                pt = str(r.get("parent_table") or r.get("tabname") or "").strip()
+                                pc = str(r.get("parent_column") or r.get("colname") or "").strip()
+                                sn = str(r.get("object_name") or r.get("table_name") or "").strip()
+                                if pt and sn:
+                                    identity_seq_meta[sn.upper()] = {
+                                        "parent_table": pt,
+                                        "parent_column": pc,
+                                        "schema": str(r.get("schema_name") or source_schema or "").strip(),
+                                    }
                         nr = norm(r)
                         key = (nr["object_name"].upper(), nr["object_type"].upper())
                         if key not in seen_src_keys:
@@ -370,14 +439,51 @@ class SchemaValidator(BaseValidator):
                           for r in tgt_rows
                           if str(r.get("object_type", "")).strip().upper() == "TABLE"}
 
-        # Filter out identity sequences whose parent table exists on target (migrated as IDENTITY column)
-        if identity_seq_parent:
-            src_rows = [
-                r for r in src_rows
-                if not (str(r.get("object_type", "")).strip().upper() == "SEQUENCE"
-                        and r.get("object_name", "").strip().upper() in identity_seq_parent
-                        and identity_seq_parent[r.get("object_name", "").strip().upper()] in tgt_table_names)
-            ]
+        # Azure IDENTITY columns: (table_upper -> list of column names)
+        azure_identity_by_table: dict[str, list[str]] = {}
+        id_q = getattr(tgt_d, "catalog_identity_columns_query", lambda s: None)(target_schema)
+        if id_q:
+            try:
+                for r in self._target_execute(id_q):
+                    tbl = _catalog_row_table(r)
+                    col = _catalog_row_column(r)
+                    if tbl and col:
+                        azure_identity_by_table.setdefault(tbl.upper(), []).append(col)
+            except Exception:
+                pass
+
+        remapped_identity_seqs: list[dict[str, Any]] = []
+        if identity_seq_meta:
+            kept_src: list[dict] = []
+            for r in src_rows:
+                if str(r.get("object_type", "")).strip().upper() != "SEQUENCE":
+                    kept_src.append(r)
+                    continue
+                sn_u = str(r.get("object_name", "")).strip().upper()
+                meta = identity_seq_meta.get(sn_u)
+                if not meta:
+                    kept_src.append(r)
+                    continue
+                parent_u = meta["parent_table"].upper()
+                # Parent table exists on Azure → identity sequence migrated as IDENTITY column
+                if parent_u in tgt_table_names:
+                    az_cols = azure_identity_by_table.get(parent_u, [])
+                    parent_col = meta.get("parent_column") or ""
+                    dest_col = ""
+                    if parent_col and any(c.upper() == parent_col.upper() for c in az_cols):
+                        dest_col = next(c for c in az_cols if c.upper() == parent_col.upper())
+                    elif az_cols:
+                        dest_col = az_cols[0]
+                    remapped_identity_seqs.append({
+                        "sequence_name": str(r.get("object_name", "")).strip(),
+                        "parent_table": meta["parent_table"],
+                        "parent_column": parent_col,
+                        "destination_identity_column": dest_col,
+                        "destination_has_identity": bool(az_cols),
+                    })
+                    continue  # do not count as presence SOURCE_ONLY
+                kept_src.append(r)
+            src_rows = kept_src
 
         src_by_key = {name_key(r): r for r in src_rows}
         tgt_by_key = {name_key(r): r for r in tgt_rows}
@@ -408,14 +514,93 @@ class SchemaValidator(BaseValidator):
                 "schema": target_schema or sch, "table": obj_name if typ in ("TABLE", "VIEW") else "", "object_name": obj_name,
                 "object_type": typ, "status": "TARGET_ONLY", "element_path": elem,
             })
-        passed = len(details) == 0
-        summary = f"Objects: {len(src_rows)} source, {len(tgt_rows)} target; {len(details)} difference(s)."
+
+        # INFO when Azure has IDENTITY; ERROR when parent table exists but IDENTITY column is missing
+        remap_ok = 0
+        remap_missing = 0
+        for m in remapped_identity_seqs:
+            seq_name = m["sequence_name"]
+            parent_tbl = m["parent_table"]
+            parent_col = m["parent_column"]
+            dest_col = m["destination_identity_column"]
+            has_identity = bool(dest_col) or m["destination_has_identity"]
+            elem = f"{source_schema or ''}.{seq_name}"
+            mapping = {
+                "trace": "identity_sequence_mapped_to_azure_identity_column",
+                "source_of_truth": {
+                    "engine": "db2",
+                    "schema": source_schema,
+                    "sequence_name": seq_name,
+                    "seq_type": "I",
+                    "table": parent_tbl,
+                    "column": parent_col or None,
+                    "catalog": "SYSCAT.COLIDENTATTRIBUTES JOIN SYSCAT.SEQUENCES",
+                },
+                "destination": {
+                    "engine": "azure_sql",
+                    "schema": target_schema,
+                    "table": parent_tbl,
+                    "column": dest_col or None,
+                    "is_identity": has_identity,
+                    "catalog": "sys.columns WHERE is_identity = 1",
+                },
+                "pair_key": f"{parent_tbl}.{parent_col or dest_col or '*'}".upper(),
+            }
+            if has_identity:
+                remap_ok += 1
+                details.append({
+                    "source_schema": source_schema,
+                    "target_schema": target_schema,
+                    "schema": source_schema,
+                    "table": parent_tbl,
+                    "object_name": seq_name,
+                    "object_type": "SEQUENCE",
+                    "status": "INFO",
+                    "element_path": elem,
+                    "error_code": "IDENTITY_SEQUENCE_REMAPPED",
+                    "error_description": (
+                        "DB2 identity sequence maps to Azure IDENTITY column "
+                        "(not expected as sys.sequences; treated as info)"
+                    ),
+                    "mapping": mapping,
+                })
+            else:
+                remap_missing += 1
+                details.append({
+                    "source_schema": source_schema,
+                    "target_schema": target_schema,
+                    "schema": source_schema,
+                    "table": parent_tbl,
+                    "object_name": seq_name,
+                    "object_type": "SEQUENCE",
+                    "status": "MISMATCH",
+                    "element_path": elem,
+                    "error_code": "IDENTITY_COLUMN_MISSING_ON_TARGET",
+                    "error_description": (
+                        "DB2 identity sequence parent table exists on Azure but no IDENTITY column found"
+                    ),
+                    "mapping": mapping,
+                })
+
+        hard = [d for d in details if str(d.get("status") or "").upper() not in ("INFO", "WARNING")]
+        passed = len(hard) == 0
+        summary = (
+            f"Objects: {len(src_rows)} source, {len(tgt_rows)} target; "
+            f"{len(hard)} difference(s), {remap_ok} identity-sequence remap(s), "
+            f"{remap_missing} missing Azure IDENTITY."
+        )
         return ValidationResult(
             validation_name="table_presence",
             passed=passed,
             summary=summary,
             details=details,
-            stats={"source_count": len(src_rows), "target_count": len(tgt_rows), "diff_count": len(details)},
+            stats={
+                "source_count": len(src_rows),
+                "target_count": len(tgt_rows),
+                "diff_count": len(hard),
+                "identity_sequence_remap_count": remap_ok,
+                "identity_column_missing_count": remap_missing,
+            },
         )
 
     def validate_column_counts(
@@ -497,19 +682,22 @@ class SchemaValidator(BaseValidator):
         # Match by (table_name, column_name) case-insensitive for cross-schema USERID->dbo
         tgt_by_key = {}
         for r in tgt_cols:
-            tbl = str(r.get("table_name", "")).strip()
-            col = str(r.get("column_name", "")).strip()
-            tgt_by_key[(tbl.upper(), col.upper())] = r
+            tbl = _catalog_row_table(r)
+            col = _catalog_row_column(r)
+            if tbl and col:
+                tgt_by_key[(tbl.upper(), col.upper())] = r
         details = []
         for r in src_cols:
-            sch = str(r.get("schema_name", "")).strip()
-            tbl = str(r.get("table_name", "")).strip()
-            col = str(r.get("column_name", "")).strip()
+            sch = _catalog_row_schema(r)
+            tbl = _catalog_row_table(r)
+            col = _catalog_row_column(r)
+            if not tbl or not col:
+                continue
             tr = tgt_by_key.get((tbl.upper(), col.upper()))
             if tr is None:
                 continue
-            src_type = str(r.get("data_type", "")).strip().upper()
-            tgt_type = str(tr.get("data_type", "")).strip()
+            src_type = str(r.get("data_type") or r.get("typename") or "").strip().upper()
+            tgt_type = str(tr.get("data_type") or tr.get("typename") or "").strip()
             if not is_compatible_type(src_type, tgt_type):
                 ot = src_kind.get(tbl.upper(), "TABLE")
                 details.append({
@@ -548,19 +736,37 @@ class SchemaValidator(BaseValidator):
         src_kind = self._table_kind_map(resolved_src, source=True)
         tgt_by_key = {}
         for r in tgt_cols:
-            tbl = str(r.get("table_name", "")).strip()
-            col = str(r.get("column_name", "")).strip()
-            tgt_by_key[(tbl.upper(), col.upper())] = r
+            tbl = _catalog_row_table(r)
+            col = _catalog_row_column(r)
+            if tbl and col:
+                tgt_by_key[(tbl.upper(), col.upper())] = r
+
+        def _nullable_flag(v: Any) -> bool | None:
+            if v is None:
+                return None
+            if isinstance(v, bool):
+                return v
+            s = str(v).strip().upper()
+            if s in ("Y", "YES", "1", "TRUE", "T"):
+                return True
+            if s in ("N", "NO", "0", "FALSE", "F"):
+                return False
+            return None
+
         details = []
         for r in src_cols:
-            sch = str(r.get("schema_name", "")).strip()
-            tbl = str(r.get("table_name", "")).strip()
-            col = str(r.get("column_name", "")).strip()
+            sch = _catalog_row_schema(r)
+            tbl = _catalog_row_table(r)
+            col = _catalog_row_column(r)
+            if not tbl or not col:
+                continue
             tr = tgt_by_key.get((tbl.upper(), col.upper()))
             if tr is None:
                 continue
-            src_null = r.get("is_nullable")
-            tgt_null = tr.get("is_nullable")
+            src_null = _nullable_flag(r.get("is_nullable") if r.get("is_nullable") is not None else r.get("nulls"))
+            tgt_null = _nullable_flag(tr.get("is_nullable") if tr.get("is_nullable") is not None else tr.get("nulls"))
+            if src_null is None or tgt_null is None:
+                continue
             if src_null != tgt_null:
                 ot = src_kind.get(tbl.upper(), "TABLE")
                 details.append({
@@ -587,7 +793,7 @@ class SchemaValidator(BaseValidator):
         source_schema: str | None = None,
         target_schema: str | None = None,
     ) -> ValidationResult:
-        """Compare column default expressions for columns present on both sides (catalog)."""
+        """Compare column defaults. Matching definitions with different constraint names → INFO + mapping."""
         resolved_src = getattr(self, "_resolve_source_schema", lambda s: s)(source_schema) or source_schema
         src_d, tgt_d = self._source_dialect, self._target_dialect
         try:
@@ -608,22 +814,81 @@ class SchemaValidator(BaseValidator):
         src_kind = self._table_kind_map(resolved_src, source=True)
         tgt_by_key: dict[tuple[str, str], dict[str, Any]] = {}
         for r in tgt_cols:
-            tbl = str(r.get("table_name", "")).strip()
-            col = str(r.get("column_name", "")).strip()
+            tbl = _catalog_row_table(r)
+            col = _catalog_row_column(r)
             tgt_by_key[(tbl.upper(), col.upper())] = r
         details: list[dict[str, Any]] = []
+        info_n = 0
+        mismatch_n = 0
         for r in src_cols:
-            sch = str(r.get("schema_name", "")).strip()
-            tbl = str(r.get("table_name", "")).strip()
-            col = str(r.get("column_name", "")).strip()
+            sch = _catalog_row_schema(r)
+            tbl = _catalog_row_table(r)
+            col = _catalog_row_column(r)
+            if not tbl or not col:
+                continue
             tr = tgt_by_key.get((tbl.upper(), col.upper()))
             if tr is None:
                 continue
-            sdef = _norm_default_expr(r.get("column_default"))
-            tdef = _norm_default_expr(tr.get("column_default"))
-            if sdef == tdef:
+            s_raw = r.get("column_default")
+            t_raw = tr.get("column_default")
+            sdef = _norm_default_expr(s_raw)
+            tdef = _norm_default_expr(t_raw)
+            if not sdef and not tdef:
                 continue
             ot = src_kind.get(tbl.upper(), "TABLE")
+            src_cname = str(r.get("default_constraint_name") or "").strip() or (
+                "COLUMN_DEFAULT" if sdef else ""
+            )
+            tgt_cname = str(tr.get("default_constraint_name") or "").strip()
+            mapping = {
+                "trace": "column_default_paired_by_table_and_column",
+                "source_of_truth": {
+                    "engine": "db2",
+                    "schema": source_schema or sch,
+                    "table": tbl,
+                    "column": col,
+                    "constraint_name": src_cname or None,
+                    "default_expression": s_raw,
+                    "normalized": sdef or None,
+                },
+                "destination": {
+                    "engine": "azure_sql",
+                    "schema": target_schema,
+                    "table": tbl,
+                    "column": col,
+                    "constraint_name": tgt_cname or None,
+                    "default_expression": t_raw,
+                    "normalized": tdef or None,
+                },
+                "pair_key": f"{tbl}.{col}".upper(),
+            }
+            if sdef and tdef and sdef == tdef:
+                names_differ = (src_cname or "").upper() != (tgt_cname or "").upper()
+                details.append({
+                    "source_schema": source_schema,
+                    "target_schema": target_schema,
+                    "schema": sch,
+                    "table": tbl,
+                    "column": col,
+                    "status": "INFO",
+                    "element_path": element_path(source_schema or sch, tbl, col),
+                    "error_code": "DEFAULT_NAME_REMAPPED" if names_differ else "DEFAULT_MATCHED",
+                    "error_description": (
+                        "Default exists on both sides with equivalent definition "
+                        "(constraint names may differ; treated as info)"
+                        if names_differ
+                        else "Default exists on both sides with matching definition"
+                    ),
+                    "object_type": ot,
+                    "source_default": s_raw,
+                    "target_default": t_raw,
+                    "source_constraint_name": src_cname,
+                    "destination_constraint_name": tgt_cname,
+                    "mapping": mapping,
+                })
+                info_n += 1
+                continue
+            # Real difference or only one side has a default
             details.append({
                 "source_schema": source_schema,
                 "target_schema": target_schema,
@@ -633,18 +898,29 @@ class SchemaValidator(BaseValidator):
                 "status": "MISMATCH",
                 "element_path": element_path(source_schema or sch, tbl, col),
                 "error_code": "DEFAULT_MISMATCH",
-                "error_description": "Default value mismatch",
+                "error_description": (
+                    "Default missing on target"
+                    if sdef and not tdef
+                    else ("Default missing on source" if tdef and not sdef else "Default value mismatch")
+                ),
                 "object_type": ot,
-                "source_default": r.get("column_default"),
-                "target_default": tr.get("column_default"),
+                "source_default": s_raw,
+                "target_default": t_raw,
+                "source_constraint_name": src_cname,
+                "destination_constraint_name": tgt_cname,
+                "mapping": mapping,
             })
-        passed = len(details) == 0
+            mismatch_n += 1
+        passed = mismatch_n == 0
         return ValidationResult(
             validation_name="default_values",
             passed=passed,
-            summary=f"Default values: {len(details)} mismatch(es).",
+            summary=(
+                f"Default values: {mismatch_n} mismatch(es), {info_n} equivalent "
+                f"(name remapped / matched)."
+            ),
             details=details,
-            stats={"mismatch_count": len(details)},
+            stats={"mismatch_count": mismatch_n, "info_count": info_n},
         )
 
     def validate_indexes(

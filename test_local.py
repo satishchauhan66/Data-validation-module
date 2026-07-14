@@ -198,8 +198,8 @@ def test_legacy_csv_foreign_keys_and_indexes():
         assert dj["source_ref_table"] == "FACILITY"
         rix = next(r for r in rows if r["ValidationType"] == "indexes")
         ixj = json.loads(rix["DetailsJson"])
-        assert ixj["source_cols"] == "A A"
-        assert ixj["destination_cols"] == "B A"
+        assert ixj["source_columns"] == "A A"
+        assert ixj["destination_columns"] == "B A"
     finally:
         os.unlink(path)
     print("OK legacy CSV foreign keys and indexes")

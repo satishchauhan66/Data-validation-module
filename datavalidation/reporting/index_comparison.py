@@ -185,8 +185,12 @@ def compare_indexes_legacy(
         du = tgt_groups[k][0]["IsUnique"] if k in tgt_groups else None
         return su, du
 
-    # signature-based name pairs (same j_s,j_t, Kind, IsUnique, ColsSig) — different idx names
-    sig_pairs: list[tuple[str, str, str, str]] = []
+    # signature-based 1:1 name remaps (same table, Kind, IsUnique, ColsSig — different idx names)
+    # Pair greedily so each source/target index is remapped at most once.
+    remapped_src_idxs: set[tuple[str, str, str]] = set()  # (js, jt, idx)
+    remapped_tgt_idxs: set[tuple[str, str, str]] = set()
+    remap_info_rows: list[dict[str, Any]] = []
+
     src_by_sig: dict[tuple[str, str, str, bool, str], list[str]] = {}
     for k, sig in src_sig.items():
         js, jt, idx, kind, is_u = k
@@ -195,21 +199,89 @@ def compare_indexes_legacy(
     for k, sig in tgt_sig.items():
         js, jt, idx, kind, is_u = k
         tgt_by_sig.setdefault((js, jt, kind, is_u, sig), []).append(idx)
-    for sk, l_idxs in src_by_sig.items():
-        r_idxs = tgt_by_sig.get(sk, [])
-        js, jt, kind, is_u, _sig = sk
-        for li in l_idxs:
-            for ri in r_idxs:
-                if li != ri:
-                    sig_pairs.append((js, jt, li, ri))
 
     pair_by_jt: dict[tuple[str, str], dict[str, Any]] = {}
     for p in pairs:
         pair_by_jt[(p["s_schema_norm"], p["s_object_norm"])] = p
 
+    for sk, l_idxs in sorted(src_by_sig.items()):
+        r_idxs = list(tgt_by_sig.get(sk, []))
+        if not r_idxs:
+            continue
+        js, jt, kind, is_u, sig = sk
+        pair = pair_by_jt.get((js, jt), {})
+        src_sch = source_schema or pair.get("SourceSchemaName") or ""
+        src_tbl = pair.get("SourceObjectName") or ""
+        dst_sch = target_schema or pair.get("DestinationSchemaName") or ""
+        dst_tbl = pair.get("DestinationObjectName") or ""
+        # Prefer same-name matches first, then pair remaining by order
+        remaining_tgt = list(r_idxs)
+        for li in list(l_idxs):
+            if not remaining_tgt:
+                break
+            if li in remaining_tgt:
+                # Same definition AND same name → exact match; no row needed
+                remaining_tgt.remove(li)
+                remapped_src_idxs.add((js, jt, li))
+                remapped_tgt_idxs.add((js, jt, li))
+                continue
+            ri = remaining_tgt.pop(0)
+            remapped_src_idxs.add((js, jt, li))
+            remapped_tgt_idxs.add((js, jt, ri))
+            mapping = {
+                "trace": "index_paired_by_column_signature",
+                "source_of_truth": {
+                    "engine": "db2",
+                    "schema": src_sch,
+                    "table": src_tbl,
+                    "index_name": li,
+                    "kind": kind,
+                    "unique": is_u,
+                    "columns": sig,
+                },
+                "destination": {
+                    "engine": "azure_sql",
+                    "schema": dst_sch,
+                    "table": dst_tbl,
+                    "index_name": ri,
+                    "kind": kind,
+                    "unique": is_u,
+                    "columns": sig,
+                },
+                "pair_key": f"{jt}|{kind}|{sig}".upper(),
+            }
+            elem = f"{src_sch}.{src_tbl}.{li}->{ri}".strip(".")
+            remap_info_rows.append({
+                "source_schema": src_sch,
+                "target_schema": dst_sch,
+                "schema": src_sch,
+                "table": src_tbl,
+                "index": li,
+                "destination_index": ri,
+                "object_type": _detail_object_type_for_source_table(source_table_kind, src_tbl),
+                "status": "INFO",
+                "element_path": elem,
+                "error_code": "INDEX_NAME_REMAPPED",
+                "error_description": (
+                    "Index exists on both sides with equivalent definition "
+                    "(names differ; treated as info)"
+                ),
+                "source_columns": sig,
+                "destination_columns": sig,
+                "source_unique": is_u,
+                "destination_unique": is_u,
+                "index_kind": kind,
+                "mapping": mapping,
+            })
+
+    details.extend(remap_info_rows)
+
     for key in sorted(all_keys):
         js, jt, idx_norm, kind, is_u = key
         if not idx_norm:
+            continue
+        # Skip indexes already remapped (or exact name+signature matches)
+        if (js, jt, idx_norm) in remapped_src_idxs or (js, jt, idx_norm) in remapped_tgt_idxs:
             continue
         s_sig = src_sig.get(key)
         t_sig = tgt_sig.get(key)
@@ -219,17 +291,13 @@ def compare_indexes_legacy(
         dst_sch = target_schema or pair.get("DestinationSchemaName") or ""
         dst_tbl = pair.get("DestinationObjectName") or ""
 
+        # missing_src (t_sig is None): index exists on source only → missing on target.
+        # missing_tgt (s_sig is None): index exists on target only → missing on source.
         missing_src = t_sig is None
         missing_tgt = s_sig is None
         cols_match = (s_sig or "") == (t_sig or "") if s_sig is not None and t_sig is not None else False
         su, du = _uniq_for_key(key)
         uniq_match = (su == du) if su is not None and du is not None else True
-
-        has_sig_right = missing_tgt and any(sp[0] == js and sp[1] == jt and sp[2] == idx_norm for sp in sig_pairs)
-        has_sig_left = missing_src and any(sp[0] == js and sp[1] == jt and sp[3] == idx_norm for sp in sig_pairs)
-        mask = (missing_tgt and has_sig_right) or (missing_src and has_sig_left)
-        if mask:
-            continue
 
         if not (missing_src or missing_tgt or not cols_match or not uniq_match):
             continue
@@ -242,8 +310,6 @@ def compare_indexes_legacy(
             and missing_sysname_warn
             and (idx_uc.startswith("SQL") or idx_uc.startswith("PK"))
         )
-        # missing_src = (t_sig is None): index exists on source only → missing on target.
-        # missing_tgt = (s_sig is None): index exists on target only → missing on source.
         st = "WARNING" if (warn_order or warn_sys) else "error"
 
         if missing_src:
