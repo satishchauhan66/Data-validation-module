@@ -11,7 +11,6 @@ from datavalidation.reporting.cross_schema import build_table_pairs_from_catalog
 from datavalidation.reporting.index_comparison import compare_indexes_legacy
 from datavalidation.results import ValidationResult
 from datavalidation.utils.formatting import element_path
-from datavalidation.rules.datatype_map import is_compatible_type
 from datavalidation.validators.base import BaseValidator, _catalog_object_type_label
 
 
@@ -669,7 +668,9 @@ class SchemaValidator(BaseValidator):
         source_schema: str | None = None,
         target_schema: str | None = None,
     ) -> ValidationResult:
-        """Compare column data types between source and target (USERID->dbo mapping)."""
+        """Compare column data types (USERID→dbo). Conversion-map remaps → INFO; others → ERROR."""
+        from datavalidation.rules.datatype_map import classify_type_mapping
+
         resolved_src = getattr(self, "_resolve_source_schema", lambda s: s)(source_schema) or source_schema
         src_d, tgt_d = self._source_dialect, self._target_dialect
         src_cols = self._source_execute(src_d.catalog_columns_query(resolved_src, None))
@@ -679,14 +680,15 @@ class SchemaValidator(BaseValidator):
                 resolved_src = "USERID"
         tgt_cols = self._target_execute(tgt_d.catalog_columns_query(target_schema, None))
         src_kind = self._table_kind_map(resolved_src, source=True)
-        # Match by (table_name, column_name) case-insensitive for cross-schema USERID->dbo
         tgt_by_key = {}
         for r in tgt_cols:
             tbl = _catalog_row_table(r)
             col = _catalog_row_column(r)
             if tbl and col:
                 tgt_by_key[(tbl.upper(), col.upper())] = r
-        details = []
+        details: list[dict[str, Any]] = []
+        info_n = 0
+        err_n = 0
         for r in src_cols:
             sch = _catalog_row_schema(r)
             tbl = _catalog_row_table(r)
@@ -698,25 +700,75 @@ class SchemaValidator(BaseValidator):
                 continue
             src_type = str(r.get("data_type") or r.get("typename") or "").strip().upper()
             tgt_type = str(tr.get("data_type") or tr.get("typename") or "").strip()
-            if not is_compatible_type(src_type, tgt_type):
-                ot = src_kind.get(tbl.upper(), "TABLE")
+            kind = classify_type_mapping(src_type, tgt_type)
+            if kind == "exact":
+                continue
+            ot = src_kind.get(tbl.upper(), "TABLE")
+            mapping = {
+                "trace": "datatype_paired_by_conversion_utility",
+                "source_of_truth": {
+                    "engine": "db2",
+                    "schema": source_schema or sch,
+                    "table": tbl,
+                    "column": col,
+                    "data_type": src_type,
+                },
+                "destination": {
+                    "engine": "azure_sql",
+                    "schema": target_schema,
+                    "table": tbl,
+                    "column": col,
+                    "data_type": tgt_type,
+                },
+                "pair_key": f"{tbl}.{col}".upper(),
+                "classification": kind,
+            }
+            if kind == "mapped":
+                info_n += 1
                 details.append({
-                    "source_schema": source_schema, "target_schema": target_schema,
-                    "schema": sch, "table": tbl, "column": col,
-                    "source_type": src_type, "target_type": tgt_type,
+                    "source_schema": source_schema,
+                    "target_schema": target_schema,
+                    "schema": sch,
+                    "table": tbl,
+                    "column": col,
+                    "source_type": src_type,
+                    "target_type": tgt_type,
+                    "status": "INFO",
+                    "element_path": element_path(source_schema or sch, tbl, col),
+                    "error_code": "DATATYPE_CONVERSION_MAPPED",
+                    "error_description": (
+                        "DB2 type maps to Azure type per conversion utility "
+                        "(names differ; treated as info)"
+                    ),
+                    "object_type": ot,
+                    "mapping": mapping,
+                })
+            else:
+                err_n += 1
+                details.append({
+                    "source_schema": source_schema,
+                    "target_schema": target_schema,
+                    "schema": sch,
+                    "table": tbl,
+                    "column": col,
+                    "source_type": src_type,
+                    "target_type": tgt_type,
                     "status": "MISMATCH",
                     "element_path": element_path(source_schema or sch, tbl, col),
                     "error_code": "DATATYPE_NAME_MISMATCH",
-                    "error_description": "Data type name mismatch",
+                    "error_description": "Data type name mismatch (not in conversion map)",
                     "object_type": ot,
+                    "mapping": mapping,
                 })
-        passed = len(details) == 0
+        passed = err_n == 0
         return ValidationResult(
             validation_name="datatype_mapping",
             passed=passed,
-            summary=f"Datatype mapping: {len(details)} mismatch(es).",
+            summary=(
+                f"Datatype mapping: {err_n} mismatch(es), {info_n} conversion remap(s)."
+            ),
             details=details,
-            stats={"mismatch_count": len(details)},
+            stats={"mismatch_count": err_n, "info_count": info_n},
         )
 
     def validate_nullable(

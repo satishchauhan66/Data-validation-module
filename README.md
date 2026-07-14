@@ -178,6 +178,6 @@ For reports (e.g. `validate_schema()`): `report.results`, `report.all_passed`, `
 ## Change tracking
 
 - `docs/module_changes_tracker.csv` — living log of module behavior/packaging changes (Connectivity, Defaults, Catalog, Report format). Append a new `ChangeID` for each intentional change.
-- `docs/validation_rules_changelog.csv` — detailed validation **rules** (`R001`…`R020`) with root cause and fix notes.
+- `docs/validation_rules_changelog.csv` — detailed validation **rules** (`R001`…`R021`) with root cause and fix notes.
 
 See `docs/LIBRARY_ARCHITECTURE.md` for full architecture.

@@ -37,7 +37,7 @@ def _legacy_both_sides_table_context(
     dest_sch: str,
 ) -> tuple[str, str, str, str]:
     """FK / index / check rows are scoped to a child table that exists on both sides; keep both object + schema columns populated."""
-    if val_name not in ("foreign_keys", "indexes", "check_constraints", "default_values"):
+    if val_name not in ("foreign_keys", "indexes", "check_constraints", "default_values", "datatype_mapping"):
         return src_obj, dest_obj, src_sch, dest_sch
     tbl = (d.get("table") or "").strip()
     if not tbl:
@@ -328,15 +328,24 @@ class ValidationReport:
                             "destination_nullable": d.get("target_nullable"),
                         })
                     elif validation_type == "datatype_mapping":
-                        err_code = err_code or "DATATYPE_NAME_MISMATCH"
-                        err_desc = err_desc or "Data type name mismatch"
-                        details_json = _legacy_json_dumps({
+                        if raw_st == "INFO":
+                            status = "info"
+                            err_code = err_code or "DATATYPE_CONVERSION_MAPPED"
+                            err_desc = err_desc or (
+                                "DB2 type maps to Azure type per conversion utility "
+                                "(names differ; treated as info)"
+                            )
+                        else:
+                            err_code = err_code or "DATATYPE_NAME_MISMATCH"
+                            err_desc = err_desc or "Data type name mismatch"
+                        body = {
                             "column_name": d.get("column"),
                             "source_type": d.get("source_type"),
                             "destination_type": d.get("target_type"),
-                            "source_data_type": d.get("source_type"),
-                            "destination_data_type": d.get("target_type"),
-                        })
+                        }
+                        if isinstance(d.get("mapping"), dict):
+                            body["mapping"] = d["mapping"]
+                        details_json = _legacy_json_dumps(body)
                     elif validation_type == "indexes":
                         err_code = d.get("error_code") or (
                             "INDEX_MISSING_IN_TARGET"
