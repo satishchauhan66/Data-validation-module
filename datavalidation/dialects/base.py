@@ -60,6 +60,10 @@ class SQLDialect(ABC):
         """Optional: SQL returning schema_name, object_name (TableName.IndexName), object_type='INDEX'. Return None to skip."""
         return None
 
+    def catalog_index_lookup_by_name_query(self, index_name: str, table_name: str | None = None) -> str | None:
+        """Optional: find an index by name across schemas (for cross-schema owner remaps). Return None to skip."""
+        return None
+
     def catalog_presence_constraints_query(self, schema: str | None) -> str | None:
         """Optional: SQL returning schema_name, object_name (TableName.ConstraintName), object_type='CONSTRAINT'. Return None to skip."""
         return None

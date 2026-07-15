@@ -32,6 +32,22 @@ def _norm_whitespace_upper(s: Any) -> str:
     return " ".join(str(s or "").strip().upper().split())
 
 
+# Presence objects the client confirmed are out of migration scope (report as INFO, not error).
+# Keyed by (object_name_upper, object_type_upper).
+_PRESENCE_OUT_OF_SCOPE: dict[tuple[str, str], str] = {
+    ("EXPLAIN_GET_MSGS", "FUNCTION"): (
+        "Out of scope (client confirmed): DB2 EXPLAIN_GET_MSGS is an Explain utility "
+        "function and is not expected on Azure SQL; not treated as a migration defect."
+    ),
+}
+
+
+def _presence_out_of_scope_note(object_name: str, object_type: str) -> str | None:
+    """Return client note if this presence gap is explicitly out of scope; else None."""
+    key = (str(object_name or "").strip().upper(), str(object_type or "").strip().upper())
+    return _PRESENCE_OUT_OF_SCOPE.get(key)
+
+
 def _norm_default_expr(v: Any) -> str:
     """Normalize catalog default expressions for cross-engine equivalence (DB2 ↔ Azure SQL)."""
     if v is None:
@@ -397,6 +413,8 @@ class SchemaValidator(BaseValidator):
         seen_src_keys = {(str(r.get("object_name", "")).strip().upper(), str(r.get("object_type", "")).strip().upper()) for r in src_rows}
         # seq_name_upper -> {parent_table, parent_column, schema}
         identity_seq_meta: dict[str, dict[str, str]] = {}
+        # object_name_upper -> index_schema for cross-schema index remaps (CARVAR idx on USERID table)
+        cross_schema_index_meta: dict[str, dict[str, str]] = {}
         for kind, attr in [("SEQUENCE", "catalog_presence_sequences_query"), ("INDEX", "catalog_presence_indexes_query"), ("CONSTRAINT", "catalog_presence_constraints_query")]:
             if kind not in object_types:
                 continue
@@ -419,6 +437,21 @@ class SchemaValidator(BaseValidator):
                                         "schema": str(r.get("schema_name") or source_schema or "").strip(),
                                     }
                         nr = norm(r)
+                        if kind == "INDEX":
+                            idx_sch = str(r.get("index_schema") or r.get("indschema") or "").strip()
+                            tbl_sch = str(nr.get("schema_name") or try_schema or "").strip()
+                            obj = nr["object_name"]
+                            if idx_sch and tbl_sch and idx_sch.upper() != tbl_sch.upper():
+                                # Table.IndexName → "INDEXNAME" after last dot
+                                ix_name = obj.split(".")[-1] if "." in obj else obj
+                                tbl_name = obj.split(".")[0] if "." in obj else ""
+                                cross_schema_index_meta[obj.upper()] = {
+                                    "index_schema": idx_sch,
+                                    "table_schema": tbl_sch,
+                                    "table_name": tbl_name,
+                                    "index_name": ix_name,
+                                }
+                            nr["index_schema"] = idx_sch
                         key = (nr["object_name"].upper(), nr["object_type"].upper())
                         if key not in seen_src_keys:
                             seen_src_keys.add(key)
@@ -491,19 +524,151 @@ class SchemaValidator(BaseValidator):
         source_only = src_names - tgt_names
         target_only = tgt_names - src_names
 
+        # Cross-schema indexes: CARVAR.IX on USERID.TABLE ↔ dbo.TABLE.IX (Azure drops index schema).
+        # Suppress false TARGET_ONLY when the index exists on source under a different INDSCHEMA.
+        remapped_cross_schema_indexes: list[dict[str, Any]] = []
+        suppressed_target_only: set[tuple[str, str]] = set()
+        lookup_fn = getattr(src_d, "catalog_index_lookup_by_name_query", None)
+        logical_src = str(source_schema or "").strip().upper()
+        resolved_src_u = str(src_schema_for_presence or "").strip().upper()
+
+        def _index_parts(object_name: str) -> tuple[str, str]:
+            on = str(object_name or "").strip()
+            if "." in on:
+                t, i = on.split(".", 1)
+                return t.strip(), i.strip()
+            return "", on
+
+        for (key_name, typ) in list(target_only):
+            if typ != "INDEX":
+                continue
+            r = tgt_by_key.get((key_name, typ), {})
+            obj_name = str(r.get("object_name", key_name)).strip()
+            tbl_name, ix_name = _index_parts(obj_name)
+            meta = cross_schema_index_meta.get(key_name) or cross_schema_index_meta.get(obj_name.upper())
+            if not meta and callable(lookup_fn) and ix_name:
+                try:
+                    hits = list(self._source_execute(lookup_fn(ix_name, tbl_name or None)))
+                except Exception:
+                    hits = []
+                for h in hits:
+                    i_sch = str(h.get("index_schema") or h.get("indschema") or "").strip()
+                    t_sch = str(h.get("table_schema") or h.get("tabschema") or "").strip()
+                    t_nm = str(h.get("table_name") or h.get("tabname") or tbl_name).strip()
+                    i_nm = str(h.get("index_name") or h.get("indname") or ix_name).strip()
+                    t_sch_u = t_sch.upper()
+                    if not i_sch or not t_sch:
+                        continue
+                    if i_sch.upper() == t_sch_u:
+                        continue
+                    # Table must belong to the migration source schema (USERID / resolved)
+                    if logical_src and t_sch_u not in (logical_src, resolved_src_u, "USERID"):
+                        continue
+                    if tbl_name and t_nm.upper() != tbl_name.upper():
+                        continue
+                    meta = {
+                        "index_schema": i_sch,
+                        "table_schema": t_sch,
+                        "table_name": t_nm,
+                        "index_name": i_nm,
+                    }
+                    break
+            if meta:
+                remapped_cross_schema_indexes.append({
+                    "object_name": obj_name,
+                    "table_name": meta.get("table_name") or tbl_name,
+                    "index_name": meta.get("index_name") or ix_name,
+                    "index_schema": meta["index_schema"],
+                    "table_schema": meta["table_schema"],
+                    "pair_status": "TARGET_ONLY_RESOLVED",
+                })
+                suppressed_target_only.add((key_name, typ))
+
+        # Matched indexes already present via TABSCHEMA filter but owned under another INDSCHEMA
+        for (key_name, typ) in (src_names & tgt_names):
+            if typ != "INDEX":
+                continue
+            meta = cross_schema_index_meta.get(key_name)
+            sr = src_by_key.get((key_name, typ), {})
+            if not meta:
+                idx_sch = str(sr.get("index_schema") or "").strip()
+                tbl_sch = str(sr.get("schema_name") or source_schema or "").strip()
+                if not (idx_sch and tbl_sch and idx_sch.upper() != tbl_sch.upper()):
+                    continue
+                obj_name = str(sr.get("object_name", key_name)).strip()
+                tbl_name, ix_name = _index_parts(obj_name)
+                meta = {
+                    "index_schema": idx_sch,
+                    "table_schema": tbl_sch,
+                    "table_name": tbl_name,
+                    "index_name": ix_name,
+                }
+            # Avoid duplicate if already resolved from TARGET_ONLY path
+            already = any(
+                str(m.get("object_name", "")).upper() == key_name
+                for m in remapped_cross_schema_indexes
+            )
+            if already:
+                continue
+            obj_name = str(sr.get("object_name", key_name)).strip()
+            remapped_cross_schema_indexes.append({
+                "object_name": obj_name,
+                "table_name": meta.get("table_name") or _index_parts(obj_name)[0],
+                "index_name": meta.get("index_name") or _index_parts(obj_name)[1],
+                "index_schema": meta["index_schema"],
+                "table_schema": meta["table_schema"],
+                "pair_status": "MATCHED",
+            })
+
         details = []
+        out_of_scope_ok = 0
         # Use logical schema (USERID/dbo) for element_path so report matches old tool
         for (key_name, typ) in source_only:
             r = src_by_key.get((key_name, typ), {})
             obj_name = str(r.get("object_name", key_name)).strip()
             sch = str(r.get("schema_name") or source_schema or "").strip()
             elem = f"{source_schema or sch}.{obj_name}" if (source_schema or sch) or obj_name else obj_name
+            oos_note = _presence_out_of_scope_note(obj_name, typ)
+            if oos_note:
+                out_of_scope_ok += 1
+                details.append({
+                    "source_schema": source_schema,
+                    "target_schema": target_schema,
+                    "schema": source_schema or sch,
+                    "table": obj_name if typ in ("TABLE", "VIEW") else "",
+                    "object_name": obj_name,
+                    "object_type": typ,
+                    "status": "INFO",
+                    "element_path": elem,
+                    "error_code": "PRESENCE_OUT_OF_SCOPE",
+                    "error_description": oos_note,
+                    "mapping": {
+                        "trace": "presence_out_of_scope_client_confirmed",
+                        "source_of_truth": {
+                            "engine": "db2",
+                            "schema": source_schema or sch,
+                            "object_name": obj_name,
+                            "object_type": typ,
+                        },
+                        "destination": {
+                            "engine": "azure_sql",
+                            "schema": target_schema,
+                            "object_name": None,
+                            "object_type": typ,
+                            "expected": False,
+                        },
+                        "note": oos_note,
+                    },
+                })
+                continue
             details.append({
                 "source_schema": source_schema, "target_schema": target_schema,
                 "schema": source_schema or sch, "table": obj_name if typ in ("TABLE", "VIEW") else "", "object_name": obj_name,
                 "object_type": typ, "status": "SOURCE_ONLY", "element_path": elem,
             })
         for (key_name, typ) in target_only:
+            if (key_name, typ) in suppressed_target_only:
+                continue
             r = tgt_by_key.get((key_name, typ), {})
             obj_name = str(r.get("object_name", key_name)).strip()
             sch = str(r.get("schema_name") or target_schema or "").strip()
@@ -581,12 +746,63 @@ class SchemaValidator(BaseValidator):
                     "mapping": mapping,
                 })
 
+        cross_schema_ix_ok = 0
+        for m in remapped_cross_schema_indexes:
+            cross_schema_ix_ok += 1
+            obj_name = m["object_name"]
+            tbl = m["table_name"]
+            ix_name = m["index_name"]
+            idx_sch = m["index_schema"]
+            tbl_sch = m["table_schema"]
+            elem = f"{source_schema or tbl_sch}.{obj_name}"
+            mapping = {
+                "trace": "index_cross_schema_owner_remapped_to_table_schema",
+                "source_of_truth": {
+                    "engine": "db2",
+                    "index_schema": idx_sch,
+                    "index_name": ix_name,
+                    "table_schema": tbl_sch,
+                    "table": tbl,
+                    "catalog": "SYSCAT.INDEXES (INDSCHEMA may differ from TABSCHEMA)",
+                },
+                "destination": {
+                    "engine": "azure_sql",
+                    "schema": target_schema,
+                    "table": tbl,
+                    "index_name": ix_name,
+                    "catalog": "sys.indexes under table schema (dbo)",
+                },
+                "pair_key": f"{tbl}.{ix_name}".upper(),
+                "note": (
+                    "Migration converts index schema to table schema; index owned in a "
+                    "different DB2 schema (e.g. CARVAR) on a USERID/dbo table is expected."
+                ),
+            }
+            details.append({
+                "source_schema": source_schema,
+                "target_schema": target_schema,
+                "schema": source_schema or tbl_sch,
+                "table": tbl,
+                "object_name": obj_name,
+                "object_type": "INDEX",
+                "status": "INFO",
+                "element_path": elem,
+                "error_code": "INDEX_CROSS_SCHEMA_REMAPPED",
+                "error_description": (
+                    f"DB2 index {idx_sch}.{ix_name} on table {tbl_sch}.{tbl} maps to "
+                    f"{target_schema or 'dbo'}.{tbl}.{ix_name} (index schema collapsed to table schema; treated as info)"
+                ),
+                "mapping": mapping,
+            })
+
         hard = [d for d in details if str(d.get("status") or "").upper() not in ("INFO", "WARNING")]
         passed = len(hard) == 0
         summary = (
             f"Objects: {len(src_rows)} source, {len(tgt_rows)} target; "
             f"{len(hard)} difference(s), {remap_ok} identity-sequence remap(s), "
-            f"{remap_missing} missing Azure IDENTITY."
+            f"{remap_missing} missing Azure IDENTITY, "
+            f"{cross_schema_ix_ok} cross-schema index remap(s), "
+            f"{out_of_scope_ok} out-of-scope (info)."
         )
         return ValidationResult(
             validation_name="table_presence",
@@ -599,6 +815,8 @@ class SchemaValidator(BaseValidator):
                 "diff_count": len(hard),
                 "identity_sequence_remap_count": remap_ok,
                 "identity_column_missing_count": remap_missing,
+                "cross_schema_index_remap_count": cross_schema_ix_ok,
+                "presence_out_of_scope_count": out_of_scope_ok,
             },
         )
 

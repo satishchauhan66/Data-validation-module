@@ -109,20 +109,46 @@ class DB2Dialect(SQLDialect):
         """
 
     def catalog_presence_indexes_query(self, schema: str | None) -> str | None:
-        """INDEX presence: object_name = TABNAME.INDNAME; exclude primary/unique (P/U) to match old backend.
+        """INDEX presence by **table** schema (TABSCHEMA), not index schema (INDSCHEMA).
 
-        Indexes on ``EXPLAIN_*`` tables (DB2 explain facility) are omitted: they are not application objects
-        and are not replicated on Azure SQL, so they would only produce false ``PRESENCE_MISSING_IN_TARGET`` rows.
+        Migration often owns the index in a different schema (e.g. CARVAR) while the table
+        lives in USERID; Azure then creates the index under dbo. Filtering by INDSCHEMA
+        would miss those and false-flag PRESENCE_MISSING_IN_SOURCE.
+        Returns index_schema so the validator can emit INFO for cross-schema remaps.
         """
-        schema_cond = f"UPPER(INDSCHEMA) = UPPER('{schema}')" if schema else "1=1"
+        if schema:
+            s_esc = str(schema).strip().replace("'", "''")
+            schema_cond = f"UPPER(RTRIM(TABSCHEMA)) = UPPER('{s_esc}')"
+        else:
+            schema_cond = "1=1"
         return f"""
-        SELECT RTRIM(INDSCHEMA) AS schema_name,
+        SELECT RTRIM(TABSCHEMA) AS schema_name,
                RTRIM(TABNAME) || '.' || RTRIM(INDNAME) AS object_name,
-               'INDEX' AS object_type
+               'INDEX' AS object_type,
+               RTRIM(INDSCHEMA) AS index_schema
         FROM SYSCAT.INDEXES
         WHERE {schema_cond} AND UNIQUERULE NOT IN ('P', 'U')
           AND UPPER(RTRIM(TABNAME)) NOT LIKE 'EXPLAIN\\_%' ESCAPE '\\'
         ORDER BY schema_name, object_name
+        """
+
+    def catalog_index_lookup_by_name_query(self, index_name: str, table_name: str | None = None) -> str:
+        """Find an index by name across all schemas (optional table filter)."""
+        ix = str(index_name).strip().replace("'", "''")
+        tbl_cond = "1=1"
+        if table_name:
+            t = str(table_name).strip().replace("'", "''")
+            tbl_cond = f"UPPER(RTRIM(TABNAME)) = UPPER('{t}')"
+        return f"""
+        SELECT RTRIM(INDSCHEMA) AS index_schema,
+               RTRIM(TABSCHEMA) AS table_schema,
+               RTRIM(TABNAME) AS table_name,
+               RTRIM(INDNAME) AS index_name,
+               RTRIM(UNIQUERULE) AS unique_rule
+        FROM SYSCAT.INDEXES
+        WHERE UPPER(RTRIM(INDNAME)) = UPPER('{ix}')
+          AND {tbl_cond}
+        ORDER BY index_schema, table_schema, table_name
         """
 
     def catalog_presence_constraints_query(self, schema: str | None) -> str | None:
