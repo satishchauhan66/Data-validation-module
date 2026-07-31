@@ -17,6 +17,23 @@ class TestPresenceOutOfScope(unittest.TestCase):
     def test_other_functions_not_allowlisted(self):
         self.assertIsNone(_presence_out_of_scope_note("SOME_OTHER_FN", "FUNCTION"))
 
+    def test_cdc_objects_allowlisted_target_side_only(self):
+        for name, typ in [
+            ("RELOAD_LOG", "TABLE"),
+            ("TABLES_CONFIG", "TABLE"),
+            ("USP_DELETEINSERTRELOAD", "PROCEDURE"),
+            ("USP_PROCESSALLSTAGINGTABLES", "PROCEDURE"),
+        ]:
+            note = _presence_out_of_scope_note(name, typ, side="target")
+            self.assertIsNotNone(note, f"{name} should be out-of-scope on target side")
+            self.assertIn("cdc", note.lower())
+            # These are Azure-only; must NOT be suppressed if they appeared source-only
+            self.assertIsNone(_presence_out_of_scope_note(name, typ, side="source"))
+
+    def test_explain_get_msgs_only_source_side(self):
+        self.assertIsNotNone(_presence_out_of_scope_note("EXPLAIN_GET_MSGS", "FUNCTION", side="source"))
+        self.assertIsNone(_presence_out_of_scope_note("EXPLAIN_GET_MSGS", "FUNCTION", side="target"))
+
     def test_source_only_explain_get_msgs_is_info(self):
         src = ConnectionConfig(type="db2", host="h", database="d", username="u", password="x")
         tgt = ConnectionConfig(type="azure_sql", host="h", database="d", username="u", password="x")

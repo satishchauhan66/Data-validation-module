@@ -4,6 +4,7 @@ Supports dict, YAML file, and environment variable sources.
 """
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -163,6 +164,10 @@ class ValidationOptions:
     checksum_row_cap: int = 100_000
     checksum_max_mismatches: int = 10_000
     data_validation_phases: list[str] = field(default_factory=lambda: ["row_counts"])
+    # App-team-approved column type overrides: key = "COLUMN" or "TABLE.COLUMN" (case-insensitive),
+    # value = intended Azure type (e.g. "VARCHAR(150)"). When Azure's real type matches the override,
+    # a datatype mismatch on that column is reported as INFO (acknowledged) instead of an error.
+    column_type_overrides: dict[str, str] = field(default_factory=dict)
 
 
 def _env(key: str, default: str = "") -> str:
@@ -206,7 +211,6 @@ def load_config_from_file(path: str | Path) -> tuple[ConnectionConfig, Connectio
                 raise ImportError("PyYAML is required for YAML config. pip install pyyaml")
             data = yaml.safe_load(f)
         else:
-            import json
             data = json.load(f)
 
     source = ConnectionConfig.from_dict(data["source"])
@@ -230,8 +234,41 @@ def load_config_from_file(path: str | Path) -> tuple[ConnectionConfig, Connectio
         checksum_row_cap=int(opts_data.get("checksum_row_cap", 100_000)),
         checksum_max_mismatches=int(opts_data.get("checksum_max_mismatches", 10_000)),
         data_validation_phases=_parse_data_validation_phases_opt(opts_data.get("data_validation_phases")),
+        column_type_overrides=normalize_column_type_overrides(
+            opts_data.get("column_type_overrides") or data.get("column_type_overrides")
+        ),
     )
     return source, target, options
+
+
+def normalize_column_type_overrides(raw: Any) -> dict[str, str]:
+    """Normalize column type overrides to an upper-cased ``{key: type}`` dict.
+
+    Accepts a dict (``{"USER_NAME": "VARCHAR(150)"}``) or a JSON string (e.g. from the
+    ``DV_COLUMN_TYPE_OVERRIDES`` env var). Keys may be ``COLUMN``, ``TABLE.COLUMN`` or
+    ``SCHEMA.TABLE.COLUMN``; they are upper-cased for case-insensitive matching.
+    """
+    if not raw:
+        return {}
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except (ValueError, TypeError):
+            return {}
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, str] = {}
+    for k, v in raw.items():
+        key = str(k or "").strip().upper()
+        val = str(v or "").strip()
+        if key and val:
+            out[key] = val
+    return out
+
+
+def column_type_overrides_from_env() -> dict[str, str]:
+    """Read ``DV_COLUMN_TYPE_OVERRIDES`` (JSON) into a normalized override dict."""
+    return normalize_column_type_overrides(os.environ.get("DV_COLUMN_TYPE_OVERRIDES", ""))
 
 
 def _parse_data_validation_phases_opt(raw: Any) -> list[str]:

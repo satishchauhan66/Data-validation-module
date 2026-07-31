@@ -7,9 +7,11 @@ import re
 from collections import defaultdict
 from typing import Any
 
+from datavalidation.config import column_type_overrides_from_env
 from datavalidation.reporting.cross_schema import build_table_pairs_from_catalog_rows
 from datavalidation.reporting.index_comparison import compare_indexes_legacy
 from datavalidation.results import ValidationResult
+from datavalidation.rules.datatype_map import classify_type_mapping, normalize_azure_base
 from datavalidation.utils.formatting import element_path
 from datavalidation.validators.base import BaseValidator, _catalog_object_type_label
 
@@ -33,19 +35,61 @@ def _norm_whitespace_upper(s: Any) -> str:
 
 
 # Presence objects the client confirmed are out of migration scope (report as INFO, not error).
-# Keyed by (object_name_upper, object_type_upper).
-_PRESENCE_OUT_OF_SCOPE: dict[tuple[str, str], str] = {
-    ("EXPLAIN_GET_MSGS", "FUNCTION"): (
-        "Out of scope (client confirmed): DB2 EXPLAIN_GET_MSGS is an Explain utility "
-        "function and is not expected on Azure SQL; not treated as a migration defect."
-    ),
+# Keyed by (object_name_upper, object_type_upper). "side" limits which gap direction is allowed:
+#   "source" = source-only (DB2-only), "target" = target-only (Azure-only), "any" = both.
+_PRESENCE_OUT_OF_SCOPE: dict[tuple[str, str], dict[str, str]] = {
+    ("EXPLAIN_GET_MSGS", "FUNCTION"): {
+        "side": "source",
+        "note": (
+            "Out of scope (client confirmed): DB2 EXPLAIN_GET_MSGS is an Explain utility "
+            "function and is not expected on Azure SQL; not treated as a migration defect."
+        ),
+    },
+    # CDC / migration process objects created on Azure only (not present in DB2 source).
+    ("RELOAD_LOG", "TABLE"): {
+        "side": "target",
+        "note": (
+            "Out of scope (client confirmed): generated during the CDC process on Azure; "
+            "not present in DB2 source and not a migration defect."
+        ),
+    },
+    ("TABLES_CONFIG", "TABLE"): {
+        "side": "target",
+        "note": (
+            "Out of scope (client confirmed): generated during the CDC process on Azure; "
+            "not present in DB2 source and not a migration defect."
+        ),
+    },
+    ("USP_DELETEINSERTRELOAD", "PROCEDURE"): {
+        "side": "target",
+        "note": (
+            "Out of scope (client confirmed): generated during the CDC process on Azure; "
+            "not present in DB2 source and not a migration defect."
+        ),
+    },
+    ("USP_PROCESSALLSTAGINGTABLES", "PROCEDURE"): {
+        "side": "target",
+        "note": (
+            "Out of scope (client confirmed): generated during the CDC process on Azure; "
+            "not present in DB2 source and not a migration defect."
+        ),
+    },
 }
 
 
-def _presence_out_of_scope_note(object_name: str, object_type: str) -> str | None:
-    """Return client note if this presence gap is explicitly out of scope; else None."""
+def _presence_out_of_scope_note(object_name: str, object_type: str, side: str = "source") -> str | None:
+    """Return client note if this presence gap is explicitly out of scope for the given side; else None.
+
+    ``side`` is the gap direction being evaluated: ``source`` (DB2-only) or ``target`` (Azure-only).
+    """
     key = (str(object_name or "").strip().upper(), str(object_type or "").strip().upper())
-    return _PRESENCE_OUT_OF_SCOPE.get(key)
+    entry = _PRESENCE_OUT_OF_SCOPE.get(key)
+    if not entry:
+        return None
+    allowed = str(entry.get("side") or "any").strip().lower()
+    if allowed in ("any", str(side).strip().lower()):
+        return entry.get("note")
+    return None
 
 
 def _norm_default_expr(v: Any) -> str:
@@ -628,7 +672,7 @@ class SchemaValidator(BaseValidator):
             obj_name = str(r.get("object_name", key_name)).strip()
             sch = str(r.get("schema_name") or source_schema or "").strip()
             elem = f"{source_schema or sch}.{obj_name}" if (source_schema or sch) or obj_name else obj_name
-            oos_note = _presence_out_of_scope_note(obj_name, typ)
+            oos_note = _presence_out_of_scope_note(obj_name, typ, side="source")
             if oos_note:
                 out_of_scope_ok += 1
                 details.append({
@@ -673,6 +717,39 @@ class SchemaValidator(BaseValidator):
             obj_name = str(r.get("object_name", key_name)).strip()
             sch = str(r.get("schema_name") or target_schema or "").strip()
             elem = f"{target_schema or sch}.{obj_name}" if (target_schema or sch) or obj_name else obj_name
+            oos_note = _presence_out_of_scope_note(obj_name, typ, side="target")
+            if oos_note:
+                out_of_scope_ok += 1
+                details.append({
+                    "source_schema": source_schema,
+                    "target_schema": target_schema,
+                    "schema": target_schema or sch,
+                    "table": obj_name if typ in ("TABLE", "VIEW") else "",
+                    "object_name": obj_name,
+                    "object_type": typ,
+                    "status": "INFO",
+                    "element_path": elem,
+                    "error_code": "PRESENCE_OUT_OF_SCOPE",
+                    "error_description": oos_note,
+                    "mapping": {
+                        "trace": "presence_out_of_scope_client_confirmed",
+                        "source_of_truth": {
+                            "engine": "db2",
+                            "schema": source_schema,
+                            "object_name": None,
+                            "object_type": typ,
+                            "expected": False,
+                        },
+                        "destination": {
+                            "engine": "azure_sql",
+                            "schema": target_schema or sch,
+                            "object_name": obj_name,
+                            "object_type": typ,
+                        },
+                        "note": oos_note,
+                    },
+                })
+                continue
             details.append({
                 "source_schema": source_schema, "target_schema": target_schema,
                 "schema": target_schema or sch, "table": obj_name if typ in ("TABLE", "VIEW") else "", "object_name": obj_name,
@@ -886,9 +963,12 @@ class SchemaValidator(BaseValidator):
         source_schema: str | None = None,
         target_schema: str | None = None,
     ) -> ValidationResult:
-        """Compare column data types (USERID→dbo). Conversion-map remaps → INFO; others → ERROR."""
-        from datavalidation.rules.datatype_map import classify_type_mapping
+        """Compare column data types (USERID→dbo). Conversion-map remaps → INFO; others → ERROR.
 
+        Columns listed in ``options.column_type_overrides`` (or ``DV_COLUMN_TYPE_OVERRIDES``) whose
+        Azure type matches the requested override are reported as INFO (app-team-approved), not error.
+        """
+        overrides = self._column_type_overrides()
         resolved_src = getattr(self, "_resolve_source_schema", lambda s: s)(source_schema) or source_schema
         src_d, tgt_d = self._source_dialect, self._target_dialect
         src_cols = self._source_execute(src_d.catalog_columns_query(resolved_src, None))
@@ -941,6 +1021,8 @@ class SchemaValidator(BaseValidator):
                 "pair_key": f"{tbl}.{col}".upper(),
                 "classification": kind,
             }
+            override_type = self._resolve_column_override(overrides, tbl, col) if kind == "mismatch" else None
+            override_ok = bool(override_type) and self._azure_type_matches_override(tgt_type, override_type)
             if kind == "mapped":
                 info_n += 1
                 details.append({
@@ -957,6 +1039,32 @@ class SchemaValidator(BaseValidator):
                     "error_description": (
                         "DB2 type maps to Azure type per conversion utility "
                         "(names differ; treated as info)"
+                    ),
+                    "object_type": ot,
+                    "mapping": mapping,
+                })
+            elif override_ok:
+                info_n += 1
+                mapping["classification"] = "overridden"
+                mapping["override"] = {
+                    "requested_type": override_type,
+                    "requested_by": "app_team",
+                    "note": f"Column type overridden to {override_type} on App team's request",
+                }
+                details.append({
+                    "source_schema": source_schema,
+                    "target_schema": target_schema,
+                    "schema": sch,
+                    "table": tbl,
+                    "column": col,
+                    "source_type": src_type,
+                    "target_type": tgt_type,
+                    "status": "INFO",
+                    "element_path": element_path(source_schema or sch, tbl, col),
+                    "error_code": "DATATYPE_OVERRIDE_ACKNOWLEDGED",
+                    "error_description": (
+                        f"Column type overridden to {override_type} on App team's request "
+                        "(acknowledged; treated as info)"
                     ),
                     "object_type": ot,
                     "mapping": mapping,
@@ -988,6 +1096,41 @@ class SchemaValidator(BaseValidator):
             details=details,
             stats={"mismatch_count": err_n, "info_count": info_n},
         )
+
+    def _column_type_overrides(self) -> dict[str, str]:
+        """Merge app-team column type overrides from options and ``DV_COLUMN_TYPE_OVERRIDES`` env (env wins)."""
+        merged: dict[str, str] = {}
+        opt = getattr(self.options, "column_type_overrides", None) or {}
+        for k, v in dict(opt).items():
+            key = str(k or "").strip().upper()
+            val = str(v or "").strip()
+            if key and val:
+                merged[key] = val
+        merged.update(column_type_overrides_from_env())
+        return merged
+
+    @staticmethod
+    def _resolve_column_override(
+        overrides: dict[str, str], table: str, column: str
+    ) -> str | None:
+        """Look up the override type for a column. Most specific key wins: TABLE.COLUMN then COLUMN."""
+        if not overrides:
+            return None
+        tbl = str(table or "").strip().upper()
+        col = str(column or "").strip().upper()
+        for key in (f"{tbl}.{col}", col):
+            if key in overrides:
+                return overrides[key]
+        return None
+
+    @staticmethod
+    def _azure_type_matches_override(azure_type: str, override_type: str) -> bool:
+        """True when the actual Azure base type equals the override's base type (length ignored)."""
+        az = normalize_azure_base(azure_type)
+        ov = normalize_azure_base(override_type)
+        if not az or not ov:
+            return False
+        return az == ov or az.startswith(ov) or ov.startswith(az)
 
     def validate_nullable(
         self,

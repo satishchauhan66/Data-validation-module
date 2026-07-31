@@ -75,3 +75,6 @@ outputs/
 .DS_Store
 Thumbs.db
 Desktop.ini
+docs/module_changes_tracker.csv
+docs/validation_rules_changelog.csv
+docs/validation_rules_changelog.csv

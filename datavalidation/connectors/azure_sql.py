@@ -24,6 +24,14 @@ def _token_struct(token: str) -> bytes:
     return struct.pack("=i", len(exptoken)) + exptoken
 
 
+# Windows integrated / trusted-connection auth aliases (on-prem SQL Server; uses current Windows identity).
+_WINDOWS_AUTH = ("windows", "trusted", "integrated", "windows_integrated", "trusted_connection")
+
+
+def _is_windows_auth(config: ConnectionConfig) -> bool:
+    return str(config.auth or "").strip().lower() in _WINDOWS_AUTH
+
+
 def _build_connection_string(config: ConnectionConfig, use_token: bool = False) -> str:
     """Build pyodbc connection string. When use_token is True, do not add UID/PWD (token is passed via attrs_before)."""
     driver = config.driver or "ODBC Driver 18 for SQL Server"
@@ -36,7 +44,10 @@ def _build_connection_string(config: ConnectionConfig, use_token: bool = False) 
     if config.trust_server_certificate:
         parts.append("TrustServerCertificate=yes")
     if not use_token:
-        if config.auth == "password" and config.username and config.password:
+        if _is_windows_auth(config):
+            # Windows integrated auth: current process identity; no UID/PWD, no AAD.
+            parts.append("Trusted_Connection=yes")
+        elif config.auth == "password" and config.username and config.password:
             parts.append(f"UID={config.username}")
             parts.append(f"PWD={config.password}")
         else:
@@ -64,6 +75,9 @@ def _get_azure_token(config: ConnectionConfig) -> str | None:
 
     scope = "https://database.windows.net/.default"
 
+    if _is_windows_auth(config):
+        # Windows integrated auth uses Trusted_Connection in the ODBC string, not an AAD token.
+        return None
     if config.auth == "managed_identity":
         cred = (
             ManagedIdentityCredential(client_id=config.client_id)
